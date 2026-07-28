@@ -1,14 +1,18 @@
 """TheAuditor — the frozen contract between Person A and Person B.
 
-Track 2, AMD AI DevMaster Hackathon 2026.        SCHEMA_VERSION = "1.1"
+Track 2, AMD AI DevMaster Hackathon 2026.        SCHEMA_VERSION = "1.2"
 
 RULES OF THIS FILE
 ------------------
 1. This is the ONLY shared interface in the project. Everything imports it;
    it imports nothing from the project.
 2. After both people sign off, changes require BOTH signatures and a bump of
-   SCHEMA_VERSION. Any change invalidates B's prompt-prefix cache and any
-   benchmark that embedded the schema text — B re-runs affected benchmarks.
+   SCHEMA_VERSION. Distinguish two kinds:
+     WIRE-BREAKING — any change to CanonicalDoc / LineItem / the answer-key
+       types. These alter the JSON Schema in B's extraction prompt, so the
+       prefix cache is invalidated and affected benchmarks must be re-run.
+     POLICY-ONLY — tolerance bands, helper functions, verifier-internal
+       shapes. No wire impact; B re-runs nothing. Record it in WIRE_COMPATIBLE_WITH.
 3. Wire format is JSON (JSONL for batches). Money and dates travel as
    STRINGS on the wire and are parsed to Decimal / date on load.
    JSON numbers are FORBIDDEN for money — floats hallucinate cents.
@@ -40,11 +44,33 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-SCHEMA_VERSION = "1.1"
+from theauditor.precision import inferred_tolerance
+
+SCHEMA_VERSION = "1.2"
+
+# Versions whose WIRE FORMAT this schema can still read. The freeze protects
+# the interchange types; internal policy (tolerance bands, helper functions)
+# may evolve without a wire break. B only has to re-run benchmarks when a
+# version leaves this list.
+WIRE_COMPATIBLE_WITH = ("1.2",)
+
+# --- CHANGELOG ---------------------------------------------------------------
+# 1.2  WIRE-BREAKING. Discovered by building the generator (A1):
+#      - LineItem.unit_price / line_total are now Optional. A goods receipt
+#        legitimately records quantities with no prices; forcing 0 there would
+#        have violated the never-zero-for-absent rule and made partial-shipment
+#        detection impossible.
+#      - CanonicalDoc.doc_number added. Documents reference each other by the
+#        identifier PRINTED ON THE PAGE, which cannot be doc_id: doc_id is
+#        deliberately opaque so the linker cannot cheat. Both are needed.
+#      Policy-only (no wire impact): precision-inferred tolerance,
+#      Tolerance.inferred_multiplier, CheckResult.field_path.
+# 1.1  EN 16931 alignment, tolerance model, line_id, UBL doc types.
+# 1.0  Initial contract.
 
 
 # ---------------------------------------------------------------------------
@@ -136,17 +162,41 @@ class Tolerance(_Base):
                     "None = uncapped. Stops a 2% pass on a $1M line.")
     abs_floor: Decimal = Field(
         default=Decimal("0.01"),
-        description="Minimum allowance — rounding grace. Never flag a cent.")
+        description="Minimum allowance when nothing better can be inferred. "
+                    "This is the FALLBACK, not the primary rule — see "
+                    "precision.py for why a fixed floor is wrong in both "
+                    "directions.")
+    inferred_multiplier: Decimal = Field(
+        default=Decimal("1.1"),
+        description="Buffer applied to precision-inferred tolerance. Mirrors "
+                    "Beancount's inferred_tolerance_multiplier; 1.1 is its "
+                    "documented recommendation.")
 
 
-def allowed_delta(reference: Decimal, tol: Tolerance) -> Decimal:
+def allowed_delta(
+    reference: Decimal,
+    tol: Tolerance,
+    rendered: Sequence[str] | None = None,
+) -> Decimal:
     """Single implementation of the tolerance rule. BOTH the verifier and the
-    reconciler call this — two implementations would drift and the drift would
-    show up as an unreproducible precision/recall number."""
+    reconciler call this — two implementations would drift, and the drift
+    would surface as an unreproducible precision/recall number.
+
+    `rendered` is the list of amount strings AS THE DOCUMENT PRINTED THEM,
+    for every operand in the identity being checked. When supplied, the
+    floor becomes the precision the document actually committed to rather
+    than a fixed constant. Omit it and behaviour is the v1.1 fixed floor,
+    so existing callers are unaffected.
+    """
     band = abs(reference) * tol.pct
     if tol.abs_cap is not None:
         band = min(band, tol.abs_cap)
-    return max(band, tol.abs_floor)
+
+    floor = tol.abs_floor
+    if rendered:
+        inferred = inferred_tolerance(rendered, tol.inferred_multiplier)
+        floor = max(floor, inferred)
+    return max(band, floor)
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +216,18 @@ class LineItem(_Base):
         description="EA / KG / HUR etc. (UN/ECE Rec 20 codes or free text). "
                     "UoM conversion is a real cause of quantity variance — "
                     "without this field a legitimate variance is unexplainable.")
-    unit_price: Decimal                   # BT-146
+    unit_price: Optional[Decimal] = Field(
+        default=None,
+        description="BT-146. None on documents that record quantities but no "
+                    "money — a goods receipt or despatch advice. NEVER 0 for "
+                    "absent; a zero price is a hallucinated number.")
     line_allowance: Optional[Decimal] = Field(
         default=None,
         description="Line-level discount. BT-136.")
-    line_total: Decimal = Field(
+    line_total: Optional[Decimal] = Field(
+        default=None,
         description="Line net amount (BT-131) = quantity x unit_price "
-                    "- line_allowance.")
+                    "- line_allowance. None on quantity-only documents.")
 
     @field_validator("quantity", "unit_price", "line_allowance", "line_total",
                      mode="before")
@@ -192,6 +247,13 @@ class CanonicalDoc(_Base):
     doc_id: str = Field(description="Generator-assigned, globally unique, "
                                     "semantically opaque. Encodes NOTHING — "
                                     "no doc_type, no chain membership.")
+    doc_number: str = Field(
+        description="The identifier PRINTED ON THE DOCUMENT, e.g. 'PO-4021'. "
+                    "This is what other documents cite in `references`, and "
+                    "it is what the linker matches on. It is NOT doc_id: "
+                    "doc_id is opaque ground truth so the linker cannot "
+                    "cheat, doc_number is visible evidence it must reason "
+                    "from. Both are required and they are different things.")
     doc_type: DocType
     party_name: str
     doc_date: date = Field(description="Normalised ISO-8601.")
@@ -379,6 +441,13 @@ class CheckOutcome(str, Enum):
 class CheckResult(_Base):
     check: CheckName
     outcome: CheckOutcome
+    field_path: Optional[str] = Field(
+        default=None,
+        description="Where the failure is, e.g. 'line_items[LI-002].line_total'. "
+                    "Beancount's validation errors carry a source location and "
+                    "it is the difference between 'this document failed' and "
+                    "'this field failed'. The console answers 'which invariant "
+                    "failed and by how much' from this.")
     expected: Optional[str] = None    # stringified — human-readable audit line
     actual: Optional[str] = None
     delta: Optional[Decimal] = None

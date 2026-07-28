@@ -48,6 +48,7 @@ def make_fixture_doc() -> CanonicalDoc:
     """
     return CanonicalDoc(
         doc_id="D-000123",
+        doc_number="INV-4021",
         doc_type=DocType.INVOICE,
         party_name="Northwind Traders",
         doc_date=date(2026, 7, 20),
@@ -218,6 +219,7 @@ def test_rounding_policy_is_recorded():
 def test_absent_amounts_are_none_not_zero():
     payment = CanonicalDoc(
         doc_id="D-000900",
+        doc_number="PAY-4021",
         doc_type=DocType.PAYMENT,
         party_name="Northwind Traders",
         doc_date=date(2026, 7, 25),
@@ -230,6 +232,22 @@ def test_absent_amounts_are_none_not_zero():
     assert payment.subtotal is None
     assert payment.tax is None
     assert payment.allowance_total is None
+
+
+def test_wire_compatibility_is_declared():
+    """A 1.2 reader must state which wire versions it accepts, so a records
+    file tagged with an older version fails loudly instead of silently."""
+    from theauditor.schemas import WIRE_COMPATIBLE_WITH
+    assert SCHEMA_VERSION in WIRE_COMPATIBLE_WITH
+
+
+def test_check_result_can_locate_the_failure():
+    """Beancount's validation errors carry a source location; ours carry a
+    field_path. 'This field failed' beats 'this document failed'."""
+    r = CheckResult(check=CheckName.LINE_NET_AMOUNT, outcome=CheckOutcome.FAIL,
+                    field_path="line_items[LI-002].line_total",
+                    delta=Decimal("0.40"))
+    assert r.field_path.endswith(".line_total")
 
 
 def test_goods_receipt_is_distinct_from_despatch_advice():
@@ -288,7 +306,7 @@ def test_partial_shipment_anomaly_exists():
 
 def test_schema_version_travels():
     rec = ExtractedRecord(doc=make_fixture_doc(), meta=ExtractionMeta())
-    assert rec.meta.schema_version == SCHEMA_VERSION == "1.1"
+    assert rec.meta.schema_version == SCHEMA_VERSION == "1.2"
 
 
 def test_scoring_modes_are_declarable():
