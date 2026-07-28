@@ -1,0 +1,42 @@
+{
+  "doc": {
+    "doc_id": "F-0007",
+    "doc_number": "A7C2E1-0042",
+    "doc_type": "invoice",
+    "party_name": "Lanternfish Software",
+    "doc_date": "2026-07-01",
+    "doc_date_raw": "July 1, 2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Team plan - annual (Jul 2026 - Jun 2027)",
+        "quantity": "1",
+        "unit_of_measure": "EA",
+        "unit_price": "2450.00",
+        "line_allowance": null,
+        "line_total": "2450.00"
+      }
+    ],
+    "subtotal": "2450.00",
+    "allowance_total": null,
+    "charge_total": null,
+    "total_excl_tax": "2450.00",
+    "tax": null,
+    "total": "2450.00",
+    "rounding_amount": null,
+    "amount_due": "2450.00",
+    "references": [],
+    "payment_terms": "Due July 15, 2026",
+    "source_text": "Invoice\nInvoice number   A7C2E1-0042\nDate of issue    July 1, 2026\nDate due         July 15, 2026\n\nLanternfish Software\n\n$2,400.00 USD due July 15, 2026\n\nDescription                                Qty   Unit price   Amount\nTeam plan - annual (Jul 2026 - Jun 2027)     1    $2,400.00   $2,400.00\n\nSubtotal                                                      $2,400.00\nAmount due                                                    $2,400.00\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

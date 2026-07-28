@@ -1,0 +1,53 @@
+{
+  "doc": {
+    "doc_id": "F-0003",
+    "doc_number": "4500012345",
+    "doc_type": "purchase_order",
+    "party_name": "Averill Fastener GmbH",
+    "doc_date": "2026-03-27",
+    "doc_date_raw": "27.03.2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Hex bolt M10x60 zinc",
+        "quantity": "550",
+        "unit_of_measure": "EA",
+        "unit_price": "12.35",
+        "line_allowance": null,
+        "line_total": "6175.00"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Locking washer M10",
+        "quantity": "120",
+        "unit_of_measure": "EA",
+        "unit_price": "48.00",
+        "line_allowance": null,
+        "line_total": "5760.00"
+      }
+    ],
+    "subtotal": "11935.00",
+    "allowance_total": null,
+    "charge_total": "250.00",
+    "total_excl_tax": "12185.00",
+    "tax": null,
+    "total": "12185.00",
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [
+      "QT-88113"
+    ],
+    "payment_terms": "ZB01 - Net 45",
+    "source_text": "Purchase Order\nDocument No. 4500012345                      Date: 27.03.2026\nVendor: 100447 Averill Fastener GmbH\nPurch. Org.: 1000   Purch. Group: 001   Company Code: 1000\nTerms of Payment: ZB01 - Net 45\nYour quotation: QT-88113\n\nItem  Material Description         Order Qty  Un   Net Price  Per  Net Value\n00010 Hex bolt M10x60 zinc              500   EA       12.35    1   6,175.00\n00020 Locking washer M10                120   EA       48.00    1   5,760.00\n\n                                        Total net item value   11,935.00\n                                        Freight (FRB1)            250.00\n                                        Net value incl. delivery costs\n                                                               12,185.00\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "doc": {
+    "doc_id": "F-0005",
+    "doc_number": "SO-2201",
+    "doc_type": "sales_order",
+    "party_name": "Brightwell Labs Inc.",
+    "doc_date": "2026-05-22",
+    "doc_date_raw": "5/22/2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Peristaltic pump PX-300",
+        "quantity": "3",
+        "unit_of_measure": "EA",
+        "unit_price": "2150.00",
+        "line_allowance": null,
+        "line_total": "6450.00"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "On-site calibration",
+        "quantity": "1.5",
+        "unit_of_measure": "HUR",
+        "unit_price": "180.00",
+        "line_allowance": null,
+        "line_total": "270.00"
+      }
+    ],
+    "subtotal": "6720.00",
+    "allowance_total": "336.00",
+    "charge_total": "95.00",
+    "total_excl_tax": "6479.00",
+    "tax": "388.74",
+    "total": "6877.74",
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [
+      "Q-4410"
+    ],
+    "payment_terms": "Net 30",
+    "source_text": "Sales Order  #SO-2201\nDate 5/22/2026            Customer  Brightwell Labs Inc.\nMemo: converts quote Q-4410\nTerms: Net 30\n\nItem                      Qty    Rate       Amount\nPeristaltic pump PX-300     3    2,150.00   6,450.00\nOn-site calibration       1.5      180.00     270.00\n\nSubtotal                                    6,720.00\nDiscount Item (5%)                            336.00\nShipping (Ground)                              95.00\nTotal Before Tax                            6,479.00\nTax (6%)                                      388.74\nTotal                                       6,867.74\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}
