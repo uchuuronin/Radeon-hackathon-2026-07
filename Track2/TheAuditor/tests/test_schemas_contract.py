@@ -12,7 +12,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from theauditor.schemas import (
+from schemas import (
     CROSS_DOC_TOLERANCE,
     DEFAULT_TOLERANCES,
     SCHEMA_VERSION,
@@ -237,7 +237,7 @@ def test_absent_amounts_are_none_not_zero():
 def test_wire_compatibility_is_declared():
     """A 1.2 reader must state which wire versions it accepts, so a records
     file tagged with an older version fails loudly instead of silently."""
-    from theauditor.schemas import WIRE_COMPATIBLE_WITH
+    from schemas import WIRE_COMPATIBLE_WITH
     assert SCHEMA_VERSION in WIRE_COMPATIBLE_WITH
 
 

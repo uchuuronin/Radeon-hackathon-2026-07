@@ -1,41 +1,25 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "theauditor"
-version = "0.1.0"
-description = "Private, local-first agentic reconciliation for the quote-to-cash document chain"
-requires-python = ">=3.10"
-
-# Deliberately minimal. The verifier, linker, reconciler and the whole test
-# suite must run with NOTHING but pydantic — no torch, no vllm, no GPU.
-# That is what keeps Person A's half demoable on a laptop while Person B
-# fights ROCm, and it is what makes `pytest` a 0.2-second pre-commit gate
-# instead of a 3-minute one.
-dependencies = [
-    "pydantic>=2.6",
-]
-
-[project.optional-dependencies]
-# Person B's side. Installed only on the Radeon instance.
-gpu = [
-    "openai>=1.0",      # OpenAI-compatible client pointed at LOCAL vLLM.
-                        # The client library is local; no remote endpoint is
-                        # ever configured. Noted here because the dependency
-                        # audit in the README has to explain this line.
-]
-dev = [
-    "pytest>=8.0",
-    "ruff>=0.4",
-]
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# TheAuditor — tooling configuration.
+#
+# DELIBERATELY NOT AN INSTALLABLE PACKAGE. There is no [build-system] and no
+# `pip install -e .`.
+#
+# Why: with a flat src/, the importable names would be `schemas`, `verify`,
+# `console`, `linker` — generic enough to collide with something else in the
+# ROCm image. Installing them globally to get an import path is a bad trade for
+# a two-week project. Putting `src` on the path instead costs one line here for
+# tests, and one environment variable for scripts, and pollutes nothing.
+#
+#   Dependencies:   pip install -r requirements.txt
+#   Tests:          python -m pytest          (from Track2/TheAuditor)
+#   Scripts:        $env:PYTHONPATH = "src"   (PowerShell, once per session)
+#                   export PYTHONPATH=src     (bash, on the Radeon instance)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Quiet, fast, and fails on the first sign of an unknown marker.
+# src/       -> schemas, precision, verify, linker, harmonize, extraction, console
+# generator/ -> gen  (the generator PRODUCES data and is not part of the agent,
+#               so it lives with the data rather than in src/)
+pythonpath = ["src", "data/generator"]
 addopts = "-q --strict-markers"
 
 [tool.ruff]

@@ -48,7 +48,7 @@ from typing import Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from theauditor.precision import inferred_tolerance
+from precision import inferred_tolerance
 
 SCHEMA_VERSION = "1.2"
 

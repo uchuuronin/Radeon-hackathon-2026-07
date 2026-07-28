@@ -21,12 +21,11 @@ state different PRECISION for the same value, which is exactly what
 precision.py infers tolerance from. A reconciler that only works when both
 sides print to the cent is not robust, and this makes that failure visible.
 
-NOTE ON PLACEMENT
------------------
-The master plan puts this at data/generator/gen.py. It lives under src/
-instead so it is importable and testable — `pip install -e .` only exposes
-src/, and an untested generator is a silent ground-truth risk. Output still
-lands in data/.
+SEEDED AND REPRODUCIBLE
+-----------------------
+Output is a pure function of (generator, seed). data/generated/ is gitignored,
+so the seed is the artifact — record it wherever the corpus is referenced or
+"run the generator" is underspecified for anyone reproducing our numbers.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from theauditor.schemas import (
+from schemas import (
     SCHEMA_VERSION,
     AnswerKey,
     CanonicalDoc,

@@ -10,9 +10,9 @@ from decimal import Decimal
 
 import pytest
 
-from theauditor.generate.gen import RENDERERS, generate_chain, materialise
-from theauditor.precision import amount_in_source
-from theauditor.schemas import DocType, Layout
+from gen import RENDERERS, generate_chain, materialise
+from precision import amount_in_source
+from schemas import DocType, Layout
 
 SEED = 1337
 CHAINS = [generate_chain(i, SEED) for i in range(25)]
