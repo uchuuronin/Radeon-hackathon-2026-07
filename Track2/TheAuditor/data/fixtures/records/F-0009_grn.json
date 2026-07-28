@@ -1,0 +1,53 @@
+{
+  "doc": {
+    "doc_id": "F-0009",
+    "doc_number": "GR-5000221",
+    "doc_type": "goods_receipt",
+    "party_name": "Averill Fastener GmbH",
+    "doc_date": "2026-04-08",
+    "doc_date_raw": "08.04.2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Hex bolt M10x60 zinc",
+        "quantity": "500",
+        "unit_of_measure": "EA",
+        "unit_price": null,
+        "line_allowance": null,
+        "line_total": null
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Locking washer M10",
+        "quantity": "120",
+        "unit_of_measure": "EA",
+        "unit_price": null,
+        "line_allowance": null,
+        "line_total": null
+      }
+    ],
+    "subtotal": null,
+    "allowance_total": null,
+    "charge_total": null,
+    "total_excl_tax": null,
+    "tax": null,
+    "total": null,
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [
+      "4500012345"
+    ],
+    "payment_terms": null,
+    "source_text": "Goods Receipt Slip\nMaterial Document  GR-5000221        Posting Date 08.04.2026\nVendor             Averill Fastener GmbH\nPurchase Order     4500012345\nMovement Type      101 - GR goods receipt\n\nItem  Material Description       Qty Received  UoM  Storage Loc\n0001  Hex bolt M10x60 zinc               500   EA   0001\n0002  Locking washer M10                 120   EA   0001\n\nReceived by: R. Okafor   Dock 2\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

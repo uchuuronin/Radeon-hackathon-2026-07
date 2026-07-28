@@ -1,0 +1,51 @@
+{
+  "doc": {
+    "doc_id": "F-0006",
+    "doc_number": "QT-000341",
+    "doc_type": "quote",
+    "party_name": "Sable Point Media",
+    "doc_date": "2026-02-18",
+    "doc_date_raw": "18/02/2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Podcast episode edit",
+        "quantity": "12",
+        "unit_of_measure": "EA",
+        "unit_price": "74.50",
+        "line_allowance": null,
+        "line_total": "894.00"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Studio session",
+        "quantity": "5",
+        "unit_of_measure": "HUR",
+        "unit_price": "210.00",
+        "line_allowance": null,
+        "line_total": "1050.00"
+      }
+    ],
+    "subtotal": "1944.00",
+    "allowance_total": null,
+    "charge_total": null,
+    "total_excl_tax": "1944.00",
+    "tax": "194.40",
+    "total": "2138.40",
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [],
+    "payment_terms": "Valid until 20/03/2026",
+    "source_text": "QUOTE\nQuote#       QT-000341\nQuote Date   18/02/2026\nExpiry Date  20/03/2026\nCustomer     Sable Point Media\n\n#  Item & Description        Qty    Rate      Amount\n1  Podcast episode edit      12     74.50     894.00\n2  Studio session             5    210.00   1,050.00\n\n                             Sub Total       1,944.00\n                             Tax Rate (10%)    194.40\n                             Total           2,138.40\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

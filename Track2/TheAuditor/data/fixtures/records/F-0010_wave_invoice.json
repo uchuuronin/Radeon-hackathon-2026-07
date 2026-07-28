@@ -1,0 +1,53 @@
+{
+  "doc": {
+    "doc_id": "F-0010",
+    "doc_number": "2026-0119",
+    "doc_type": "invoice",
+    "party_name": "Foxglove Joinery",
+    "doc_date": "2026-01-30",
+    "doc_date_raw": "January 30, 2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Site carpentry",
+        "quantity": "7.5",
+        "unit_of_measure": "HUR",
+        "unit_price": "120.00",
+        "line_allowance": null,
+        "line_total": "900.00"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Oak shelving unit",
+        "quantity": "3",
+        "unit_of_measure": "EA",
+        "unit_price": "415.80",
+        "line_allowance": null,
+        "line_total": "1247.40"
+      }
+    ],
+    "subtotal": "2147.40",
+    "allowance_total": "107.37",
+    "charge_total": "65.00",
+    "total_excl_tax": "2105.03",
+    "tax": "168.40",
+    "total": "2273.43",
+    "rounding_amount": null,
+    "amount_due": "2273.43",
+    "references": [
+      "EST-2026-014"
+    ],
+    "payment_terms": "Due on receipt",
+    "source_text": "INVOICE 2026-0119\nFoxglove Joinery\nDate: January 30, 2026        Payment due: On receipt\nEstimate ref: EST-2026-014\n\nItems                     Quantity    Price      Amount\nSite carpentry                 7.5    120.00     900.00\nOak shelving unit                3    415.80   1,247.40\n\nSubtotal                                       2,147.40\nDiscount - returning client (5%)                 107.37\nDelivery                                          65.00\nTotal before tax                               2,105.03\nSales tax (8%)                                   168.40\nAmount due                                    $2,273.43\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

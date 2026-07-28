@@ -1,0 +1,51 @@
+{
+  "doc": {
+    "doc_id": "F-0004",
+    "doc_number": "PO-7731",
+    "doc_type": "purchase_order",
+    "party_name": "Cobalt Office Interiors",
+    "doc_date": "2026-06-09",
+    "doc_date_raw": "06/09/2026",
+    "currency": "USD",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Task chair, mesh back",
+        "quantity": "25",
+        "unit_of_measure": "EA",
+        "unit_price": "340",
+        "line_allowance": null,
+        "line_total": "8500"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Monitor arm, dual",
+        "quantity": "40",
+        "unit_of_measure": "EA",
+        "unit_price": "65",
+        "line_allowance": null,
+        "line_total": "2600"
+      }
+    ],
+    "subtotal": "11100",
+    "allowance_total": null,
+    "charge_total": null,
+    "total_excl_tax": "11100",
+    "tax": null,
+    "total": "11100",
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [],
+    "payment_terms": "Net 60",
+    "source_text": "Purchase Order PO-7731                            Status: Issued\nSupplier: Cobalt Office Interiors                 Created: 06/09/2026\nShip To: 400 Commerce Park, Dock 4\nPayment Term: Net 60\n\nLine  Item                        Qty   Price   Total\n1     Task chair, mesh back        25     340    8500\n2     Monitor arm, dual            40      65    2600\n\n                                  Order Total   11100 USD\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

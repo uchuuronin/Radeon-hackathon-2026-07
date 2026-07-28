@@ -1,0 +1,34 @@
+{
+  "doc": {
+    "doc_id": "F-0008",
+    "doc_number": "PMT-118764",
+    "doc_type": "payment",
+    "party_name": "Brightwell Labs Inc.",
+    "doc_date": "2026-06-24",
+    "doc_date_raw": "06/24/2026",
+    "currency": "USD",
+    "line_items": [],
+    "subtotal": null,
+    "allowance_total": null,
+    "charge_total": null,
+    "total_excl_tax": null,
+    "tax": null,
+    "total": "6867.74",
+    "rounding_amount": null,
+    "amount_due": null,
+    "references": [
+      "INV-2201"
+    ],
+    "payment_terms": null,
+    "source_text": "Payment Confirmation\nPayment ID     PMT-118764\nProcess date   06/24/2026\nPayment method ACH - ePayment\nPayer          Brightwell Labs Inc.\n\nPayment amount   $6,867.74\n\nInvoice(s) paid\nInvoice #    Invoice amount    Amount paid\nINV-2201         6,867.74        6,867.74\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}

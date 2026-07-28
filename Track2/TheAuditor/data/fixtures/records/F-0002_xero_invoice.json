@@ -1,0 +1,53 @@
+{
+  "doc": {
+    "doc_id": "F-0002",
+    "doc_number": "INV-0087",
+    "doc_type": "invoice",
+    "party_name": "Harrow & Finch Ltd",
+    "doc_date": "2026-04-02",
+    "doc_date_raw": "2 Apr 2026",
+    "currency": "GBP",
+    "line_items": [
+      {
+        "line_id": "LI-001",
+        "description": "Monthly retainer - April",
+        "quantity": "10",
+        "unit_of_measure": "HUR",
+        "unit_price": "89.00",
+        "line_allowance": null,
+        "line_total": "890.00"
+      },
+      {
+        "line_id": "LI-002",
+        "description": "Brand guidelines document",
+        "quantity": "2",
+        "unit_of_measure": "EA",
+        "unit_price": "1250.00",
+        "line_allowance": null,
+        "line_total": "2500.00"
+      }
+    ],
+    "subtotal": "3390.00",
+    "allowance_total": "339.00",
+    "charge_total": null,
+    "total_excl_tax": "3051.00",
+    "tax": "610.20",
+    "total": "3661.20",
+    "rounding_amount": null,
+    "amount_due": "3661.20",
+    "references": [
+      "PO-HF-2214"
+    ],
+    "payment_terms": "Due 1 May 2026",
+    "source_text": "TAX INVOICE\n\nHarrow & Finch Ltd                       Invoice Number   INV-0087\n                                         Invoice Date     2 Apr 2026\n                                         Reference        PO-HF-2214\n                                         VAT Number       GB 442 8765 11\n\nDescription                     Quantity  Unit Price  Amount GBP\nMonthly retainer - April           10.00       89.00      890.00\nBrand guidelines document           2.00    1,250.00    2,500.00\n\n                                   Subtotal              3,390.00\n                                   Discount (10%)          339.00\n                                   Total excl. VAT       3,051.00\n                                   VAT 20%                 610.20\n                                   TOTAL GBP             3,661.20\n\nPayment due 1 May 2026.\n"
+  },
+  "meta": {
+    "model_id": "hand-written",
+    "tier": "none",
+    "prompt_version": "",
+    "schema_version": "1.2",
+    "extraction_ts": null,
+    "n_sample_index": null,
+    "layout": null
+  }
+}
