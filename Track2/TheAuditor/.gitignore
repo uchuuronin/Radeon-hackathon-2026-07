@@ -1,0 +1,74 @@
+# TheAuditor — Track2/TheAuditor/.gitignore
+# Scoped to our folder only. Do NOT add a .gitignore at the repo root:
+# the PR must touch nothing outside Track2/TheAuditor/.
+
+# --- Secrets. Rules-critical. -----------------------------------------------
+# "No remote API for core functions" is a binary compliance gate, and the
+# dependency audit claims no API keys exist anywhere in configuration.
+# One committed key undermines the whole locality claim in front of a judge.
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+credentials.*
+config.local.*
+
+# --- Model weights and caches. Never commit. --------------------------------
+# These are gigabytes and will blow the GitHub 100MB per-file hard limit,
+# which rejects the push and can require a history rewrite to recover.
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+models/
+checkpoints/
+.cache/
+huggingface/
+~/.cache/huggingface/
+
+# --- Generated data and run artifacts ---------------------------------------
+# The GENERATOR and the ANSWER KEY are committed (they are the deliverable).
+# Bulk generated documents and benchmark run outputs are not.
+data/generated/
+runs/
+!runs/.gitkeep
+*.log
+
+# Keep these — negated so the rules above cannot swallow them:
+!data/fixtures/
+!data/fixtures/**
+!data/generator/
+!data/generator/**
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.conda/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Jupyter -----------------------------------------------------------------
+.ipynb_checkpoints/
+# Notebooks: commit them cleared. Committed outputs make diffs unreviewable
+# and can leak absolute paths from the Radeon instance.

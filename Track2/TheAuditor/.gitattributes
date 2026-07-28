@@ -1,0 +1,41 @@
+# TheAuditor — line-ending policy
+#
+# WHY THIS FILE EXISTS AND WHY IT IS NOT OPTIONAL:
+# Person A develops on Windows, Person B runs on a Linux ROCm instance.
+# CanonicalDoc.source_text is BYTE-PRESERVED raw document text, and the
+# verifier's `amounts_appear_in_source` check does substring matching against
+# it. If git silently converts CRLF <-> LF on the way in or out, fixtures
+# authored on Windows will behave differently on the GPU box, and the failure
+# looks like an accuracy problem rather than a checkout problem.
+#
+# Policy: normalise source to LF; treat all DATA as binary so git never
+# touches a byte of it.
+
+# Source and docs: normalise to LF in the repo, checkout as LF everywhere.
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cfg   text eol=lf
+*.sh    text eol=lf
+
+# DATA: never convert. These are ground truth and must survive round-trips
+# byte-for-byte across operating systems.
+*.json      -text
+*.jsonl     -text
+data/**     -text
+runs/**     -text
+
+# Windows scripts genuinely want CRLF.
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+
+# Binary assets
+*.png   binary
+*.jpg   binary
+*.pdf   binary
+*.mp4   binary
+*.xlsx  binary
+*.docx  binary
+*.pptx  binary
