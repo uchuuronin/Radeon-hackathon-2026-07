@@ -31,7 +31,8 @@ from verify.engine import verify_doc, verify_pair
 
 FIXDIR = Path(__file__).parent.parent / "data" / "fixtures"
 CLEAN = sorted((FIXDIR / "records").glob("*.json"))
-CORRUPTED = sorted((FIXDIR / "corrupted").glob("*.json"))
+CORRUPTED = sorted(p for p in (FIXDIR / "corrupted").glob("*.json")
+                   if "__pair_" not in p.name)   # pair fixtures test verify_pair
 
 
 def load(p: Path) -> ExtractedRecord:
@@ -46,6 +47,84 @@ def test_hand_written_fixtures_verify_clean(path):
     fails = [c for c in report.checks if c.outcome == CheckOutcome.FAIL]
     assert not fails, f"{path.stem}: {[(c.check, c.message) for c in fails]}"
     assert report.verify_pass
+
+
+# --- the three repaired checks ----------------------------------------------
+
+def test_hallucinated_amount_coinciding_with_a_quantity_is_caught():
+    """The confirmed false positive. total=500.00 in a document whose only
+    500 is `Qty 500`. Membership says present; the counting argument says the
+    quantity already explains that occurrence, so the claim is unevidenced."""
+    doc = _doc(
+        line_items=[LineItem(line_id="LI-1", description="w",
+                             quantity=Decimal(500), unit_price=Decimal("1.00"),
+                             line_total=Decimal("500.00"))],
+        subtotal=Decimal("500.00"), total_excl_tax=Decimal("500.00"),
+        total=Decimal("500.00"),
+        source_text="Qty 500 EA @ 1.00")
+    r = verify_doc(doc)
+    src = next(c for c in r.checks
+               if c.check == CheckName.AMOUNTS_APPEAR_IN_SOURCE)
+    assert src.outcome == CheckOutcome.FAIL
+
+
+def test_same_value_printed_once_but_claimed_by_three_fields_passes():
+    """Coupa-style: subtotal, net and total are all 11100 and the document
+    prints it once. De-duplicating claims BY VALUE is what keeps this legal."""
+    doc = _doc(
+        line_items=[LineItem(line_id="LI-1", description="chair",
+                             quantity=Decimal(25), unit_price=Decimal("444"),
+                             line_total=Decimal("11100"))],
+        subtotal=Decimal("11100"), total_excl_tax=Decimal("11100"),
+        total=Decimal("11100"),
+        source_text="Line 1 chair 25 444 11100\nOrder Total 11100 USD")
+    src = next(c for c in verify_doc(doc).checks
+               if c.check == CheckName.AMOUNTS_APPEAR_IN_SOURCE)
+    assert src.outcome == CheckOutcome.PASS
+
+
+def test_date_month_and_day_are_now_verified():
+    """The confirmed no-op: right year, wrong month and day used to PASS."""
+    doc = _doc(doc_date=date(2026, 11, 5), doc_date_raw="January 30, 2026",
+               source_text="January 30, 2026")
+    d = next(c for c in verify_doc(doc).checks
+             if c.check == CheckName.DATES_PARSE_AND_ORDER)
+    assert d.outcome == CheckOutcome.FAIL
+
+
+def test_unrecognised_date_format_skips_rather_than_fails():
+    """Our format table not covering a layout is OUR limitation, not the
+    document's error. Skipping keeps it out of the confidence signal."""
+    doc = _doc(doc_date_raw="the second Tuesday of Michaelmas")
+    d = next(c for c in verify_doc(doc).checks
+             if c.check == CheckName.DATES_PARSE_AND_ORDER)
+    assert d.outcome == CheckOutcome.SKIPPED
+
+
+def test_legal_form_difference_surfaces_and_is_never_a_silent_pass():
+    """Standard guidance strips suffixes for CRM matching but carves out
+    financial and compliance contexts. Lookalike vendor names are an
+    invoice-fraud vector, so this must be visible, with both names kept."""
+    a = _doc(doc_id="T-A", party_name="Averill Fastener GmbH")
+    b = _doc(doc_id="T-B", party_name="Averill Fastener")
+    r = {c.check: c for c in verify_pair(a, b)}[CheckName.PARTY_NAMES_MATCH]
+    assert r.outcome == CheckOutcome.WITHIN_TOLERANCE
+    assert r.expected == "Averill Fastener GmbH" and r.actual == "Averill Fastener"
+    assert "distinct legal entities" in r.message
+
+
+def test_cosmetic_party_difference_is_an_exact_pass():
+    a = _doc(doc_id="T-A", party_name="Northwind  Traders,")
+    b = _doc(doc_id="T-B", party_name="northwind traders")
+    r = {c.check: c for c in verify_pair(a, b)}[CheckName.PARTY_NAMES_MATCH]
+    assert r.outcome == CheckOutcome.PASS
+
+
+def test_genuinely_different_parties_still_fail():
+    a = _doc(doc_id="T-A", party_name="Northwind Traders")
+    b = _doc(doc_id="T-B", party_name="Northwind Trading")
+    r = {c.check: c for c in verify_pair(a, b)}[CheckName.PARTY_NAMES_MATCH]
+    assert r.outcome == CheckOutcome.FAIL
 
 
 def test_generated_corpus_verifies_clean_in_both_layouts():
@@ -65,11 +144,51 @@ def test_generated_corpus_verifies_clean_in_both_layouts():
                     f"{[(c.check, c.message) for c in fails]}")
 
 
-def test_whole_unit_fixture_is_a_strict_pass():
-    """The Coupa PO states unit precision; its identities hold exactly, so it
-    must be STRICT — the high-confidence tier — not merely within tolerance."""
-    coupa = next(p for p in CLEAN if "coupa" in p.stem)
-    assert verify_doc(load(coupa).doc).strict_pass
+def test_ambiguous_printed_date_surfaces_instead_of_passing_silently(
+        monkeypatch, tmp_path):
+    """06/09/2026 is 9 June or 6 September and nothing in the string decides
+    it. The old check passed because the YEAR matched. The new one reports
+    ambiguity as WITHIN_TOLERANCE: honest, and not a manufactured failure.
+
+    Isolated from config/policy.json, which (correctly) registers this
+    vendor's order and resolves the ambiguity in normal operation."""
+    import config
+    monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "none.json")
+    config.reset_cache()
+    coupa = load(next(p for p in CLEAN if "coupa" in p.stem)).doc
+    r = verify_doc(coupa)
+    config.reset_cache()
+    d = next(c for c in r.checks if c.check == CheckName.DATES_PARSE_AND_ORDER)
+    assert d.outcome == CheckOutcome.WITHIN_TOLERANCE
+    assert "ambiguous" in d.message
+    assert r.verify_pass and not r.strict_pass
+
+
+def test_per_party_date_order_resolves_the_ambiguity():
+    """A vendor's format is stable even though the format space is not.
+    Registering the order promotes the same document to a STRICT pass."""
+    from verify import engine
+    coupa = load(next(p for p in CLEAN if "coupa" in p.stem)).doc
+    engine.PARTY_DATE_ORDER[coupa.party_name] = "MDY"
+    try:
+        r = verify_doc(coupa)
+        d = next(c for c in r.checks
+                 if c.check == CheckName.DATES_PARSE_AND_ORDER)
+        assert d.outcome == CheckOutcome.PASS
+        assert r.strict_pass, "resolving ambiguity should reach the high tier"
+    finally:
+        engine.PARTY_DATE_ORDER.pop(coupa.party_name, None)
+
+
+def test_whole_unit_fixture_arithmetic_is_exact():
+    """The Coupa PO states unit precision and its identities hold to the
+    digit — independent of the date question above."""
+    coupa = load(next(p for p in CLEAN if "coupa" in p.stem)).doc
+    arith = {CheckName.BR_CO_10, CheckName.BR_CO_13, CheckName.BR_CO_15,
+             CheckName.LINE_NET_AMOUNT}
+    for c in verify_doc(coupa).checks:
+        if c.check in arith:
+            assert c.outcome == CheckOutcome.PASS
 
 
 def test_pair_checks_pass_on_the_designed_relationships():
@@ -82,7 +201,8 @@ def test_pair_checks_pass_on_the_designed_relationships():
 # --- RECALL: every corrupted fixture trips its named check ------------------
 
 def test_corrupted_fixtures_exist():
-    assert len(CORRUPTED) == 6, (
+    assert len(CORRUPTED) == 6 and len(list(
+        (FIXDIR / "corrupted").glob("*__pair_*.json"))) == 1, (
         "run: PYTHONPATH=src python data/fixtures/make_corrupted.py")
 
 
@@ -202,3 +322,16 @@ def test_cli_exits_zero_on_clean_and_nonzero_on_corrupted(tmp_path):
 
     bad = _run_cli(str(FIXDIR / "corrupted" / "*.json"), "-q", cwd=root)
     assert bad.returncode == 1, bad.stdout + bad.stderr
+
+
+def test_pair_corrupted_fixture_fires_party_names_match():
+    """A6 completeness: party_names_match is pair-level, so its corrupted
+    fixture is a PAIR — a lookalike vendor on the GRN against the real PO."""
+    import json
+    pair = json.loads((FIXDIR / "corrupted" /
+                       "party_names_match__pair_F-0003_F-0009.json"
+                       ).read_text(encoding="utf-8"))
+    po = load(Path(pair["counterpart"]))
+    grn = ExtractedRecord.model_validate(pair["record"])
+    r = {c.check: c for c in verify_pair(po.doc, grn.doc)}
+    assert r[CheckName.PARTY_NAMES_MATCH].outcome == CheckOutcome.FAIL

@@ -35,7 +35,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Iterable, Optional
 
-from precision import amount_in_source
+from normalise import compare_parties, read_date
+from precision import unexplained_claims
 from schemas import (
     DEFAULT_TOLERANCES,
     CanonicalDoc,
@@ -152,64 +153,111 @@ def check_line_net_amounts(doc: CanonicalDoc) -> list[CheckResult]:
 
 
 def check_amounts_appear_in_source(doc: CanonicalDoc) -> CheckResult:
-    """Every stated monetary field appears in source_text BY VALUE.
+    """Every stated monetary field has INDEPENDENT evidence in source_text.
 
-    This is the anti-hallucination check, and the one the arithmetic checks
-    cannot replace: an extraction that invented a number and kept itself
-    CONSISTENT passes every identity. Roughly two-thirds of financial
-    extraction errors are invented numeric values; only the source exposes
-    the consistent ones.
+    This is the anti-hallucination check, and the one the arithmetic cannot
+    replace: an extraction that invented a number and kept itself CONSISTENT
+    passes every identity. Roughly two-thirds of financial extraction errors
+    are invented numeric values, and only the source exposes the consistent
+    ones.
 
-    By VALUE, not by raw string: one layout prints 2,477.00 and another
-    prints 2477 for the same figure; both extractions are correct and a
-    substring search would punish the second.
+    Membership alone is too weak — a hallucinated total of 500.00 "appears"
+    in a document printing `Qty 500`. So we count: a monetary value must
+    occur MORE often than the non-monetary fields (line quantities, date
+    components) already account for. See precision.unexplained_claims.
+
+    Comparison is by VALUE, never by raw string: one layout prints 2,477.00
+    and another prints 2477 for the same figure, both extractions are
+    correct, and a substring search would punish the second.
     """
     if not doc.source_text:
         return _skip(CheckName.AMOUNTS_APPEAR_IN_SOURCE, "no source_text")
-    stated: list[tuple[str, Decimal]] = []
+
+    claimed: list[tuple[str, Decimal]] = []
     for name in ("subtotal", "allowance_total", "charge_total",
                  "total_excl_tax", "tax", "total", "rounding_amount",
                  "amount_due"):
         v = getattr(doc, name)
         if v is not None:
-            stated.append((name, v))
+            claimed.append((name, v))
     for li in doc.line_items:
         if li.unit_price is not None:
-            stated.append((f"line_items[{li.line_id}].unit_price", li.unit_price))
+            claimed.append((f"line_items[{li.line_id}].unit_price", li.unit_price))
         if li.line_total is not None:
-            stated.append((f"line_items[{li.line_id}].line_total", li.line_total))
-    if not stated:
+            claimed.append((f"line_items[{li.line_id}].line_total", li.line_total))
+    if not claimed:
         return _skip(CheckName.AMOUNTS_APPEAR_IN_SOURCE, "no amounts stated")
-    missing = [(p, v) for p, v in stated
-               if not amount_in_source(v, doc.source_text)]
+
+    # Numbers we already know are on the page for NON-monetary reasons.
+    non_monetary: list[Decimal] = [li.quantity for li in doc.line_items]
+    non_monetary += [Decimal(doc.doc_date.year), Decimal(doc.doc_date.month),
+                     Decimal(doc.doc_date.day)]
+
+    missing = unexplained_claims(claimed, non_monetary, doc.source_text)
     if not missing:
         return CheckResult(check=CheckName.AMOUNTS_APPEAR_IN_SOURCE,
                            outcome=CheckOutcome.PASS)
-    p, v = missing[0]
+    path, value = missing[0]
     return CheckResult(
         check=CheckName.AMOUNTS_APPEAR_IN_SOURCE, outcome=CheckOutcome.FAIL,
-        field_path=p, expected=f"{v} present in source", actual="not found",
-        message=f"{len(missing)} amount(s) not present in source by value; "
-                f"first: {p}={v}")
+        field_path=path, expected=f"{value} present in source", actual="not found",
+        message=f"{len(missing)} amount(s) without independent evidence in "
+                f"source; first: {path}={value}")
 
 
-def check_date_parses(doc: CanonicalDoc) -> CheckResult:
-    """doc_date is a typed date by the time it reaches us — deserialisation
-    was the parse. What remains checkable at doc level is raw/normalised
-    coherence when a raw form is available."""
+#: Per-party date order, exactly like tolerance: a vendor's format is stable
+#: even though the format space is not. Absent an entry, genuine ambiguity is
+#: REPORTED rather than guessed — dateparser's own default of MDY for English
+#: would silently misread a UK or EU document.
+PARTY_DATE_ORDER: dict[str, str] = {}
+
+
+def check_date_parses(doc: CanonicalDoc,
+                      date_order: Optional[str] = None) -> CheckResult:
+    """Re-parse the printed date in code and compare with the model's
+    normalised date. Mechanism A applied properly: deterministic code checks
+    the model, never the model checking itself.
+
+    Ambiguity is not failure. 02/03/2026 is genuinely undecidable without
+    knowing the vendor, so a claim matching EITHER reading is
+    WITHIN_TOLERANCE — the same principle that stops rounding manufacturing
+    exceptions.
+    """
     if doc.doc_date_raw is None:
         return CheckResult(check=CheckName.DATES_PARSE_AND_ORDER,
                            outcome=CheckOutcome.PASS,
                            message="normalised date only")
-    raw = doc.doc_date_raw
-    year = doc.doc_date.year
-    if str(year) in raw or f"{year % 100:02d}" in raw:
-        return CheckResult(check=CheckName.DATES_PARSE_AND_ORDER,
-                           outcome=CheckOutcome.PASS)
-    return CheckResult(
-        check=CheckName.DATES_PARSE_AND_ORDER, outcome=CheckOutcome.FAIL,
-        field_path="doc_date", expected=doc.doc_date.isoformat(), actual=raw,
-        message="normalised date does not correspond to the raw date string")
+
+    import config as _config
+    order = (date_order or PARTY_DATE_ORDER.get(doc.party_name)
+             or _config.load().date_order_for(doc.party_name))
+    reading = read_date(doc.doc_date_raw, order)
+
+    if not reading.candidates:
+        return CheckResult(
+            check=CheckName.DATES_PARSE_AND_ORDER, outcome=CheckOutcome.SKIPPED,
+            field_path="doc_date_raw", actual=doc.doc_date_raw,
+            message="raw date format not recognised — cannot verify")
+
+    if doc.doc_date not in reading.candidates:
+        return CheckResult(
+            check=CheckName.DATES_PARSE_AND_ORDER, outcome=CheckOutcome.FAIL,
+            field_path="doc_date", expected=" or ".join(
+                c.isoformat() for c in reading.candidates),
+            actual=doc.doc_date.isoformat(),
+            message="normalised date does not match the printed date")
+
+    if reading.ambiguous:
+        return CheckResult(
+            check=CheckName.DATES_PARSE_AND_ORDER,
+            outcome=CheckOutcome.WITHIN_TOLERANCE, field_path="doc_date",
+            expected=" or ".join(c.isoformat() for c in reading.candidates),
+            actual=doc.doc_date.isoformat(),
+            message=f"{doc.doc_date_raw!r} is ambiguous; claim matches one "
+                    f"reading. Set PARTY_DATE_ORDER for this vendor to resolve.")
+
+    return CheckResult(check=CheckName.DATES_PARSE_AND_ORDER,
+                       outcome=CheckOutcome.PASS)
 
 
 def verify_doc(doc: CanonicalDoc) -> VerificationReport:
@@ -229,15 +277,25 @@ def verify_doc(doc: CanonicalDoc) -> VerificationReport:
 # Pair-level checks — called by the reconciler while walking a chain
 # ---------------------------------------------------------------------------
 
-def _norm_party(name: str) -> str:
-    return " ".join(name.split()).casefold()
-
-
 def verify_pair(earlier: CanonicalDoc, later: CanonicalDoc) -> list[CheckResult]:
     out: list[CheckResult] = []
-    if _norm_party(earlier.party_name) == _norm_party(later.party_name):
+    m = compare_parties(earlier.party_name, later.party_name)
+    if m.exact:
         out.append(CheckResult(check=CheckName.PARTY_NAMES_MATCH,
                                outcome=CheckOutcome.PASS))
+    elif m.same_base:
+        # Same base name, different legal form. Standard guidance strips
+        # suffixes for CRM matching but carves out an exception for financial
+        # and compliance contexts, which is exactly where we sit: "Acme Inc"
+        # and "Acme LLC" may be different legal entities, and lookalike
+        # vendor names are a live invoice-fraud vector. So this SURFACES with
+        # both raw names intact and is never silently passed.
+        out.append(CheckResult(
+            check=CheckName.PARTY_NAMES_MATCH,
+            outcome=CheckOutcome.WITHIN_TOLERANCE, field_path="party_name",
+            expected=earlier.party_name, actual=later.party_name,
+            message="same base name, different legal form — review: these may "
+                    "be distinct legal entities"))
     else:
         out.append(CheckResult(
             check=CheckName.PARTY_NAMES_MATCH, outcome=CheckOutcome.FAIL,

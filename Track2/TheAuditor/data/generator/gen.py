@@ -115,7 +115,8 @@ def _lines(rng: random.Random) -> list[LineItem]:
     return out
 
 
-def generate_chain(chain_index: int, seed: int) -> ChainBundle:
+def generate_chain(chain_index: int, seed: int,
+                   force_allowance: bool = False) -> ChainBundle:
     """One deal, six documents, arithmetically airtight."""
     rng = random.Random(seed * 100_000 + chain_index)
     chain_id = f"C-{chain_index:04d}"
@@ -126,8 +127,16 @@ def generate_chain(chain_index: int, seed: int) -> ChainBundle:
     items = _lines(rng)
     subtotal = q(sum((li.line_total for li in items), Decimal(0)))
 
-    allowance = q(subtotal * Decimal(rng.randint(3, 12)) / 100) if rng.random() < 0.35 else None
-    charge = rng.choice(FREIGHT) if rng.random() < 0.40 else None
+    # STRATIFIED, not sampled. Independent 35%/40% coin flips left the
+    # allowance-only combination at 1 chain in 20 on seed 1337 and made the
+    # both-terms BR-CO-13 path a coin toss. Round-robin guarantees all four
+    # combos every 4 chains; magnitudes stay random (that is where variance
+    # belongs). force_allowance lets the injector demand an allowance for
+    # unapplied_discount chains.
+    has_allowance = force_allowance or chain_index % 4 in (2, 3)
+    has_charge = chain_index % 4 in (1, 3)
+    allowance = q(subtotal * Decimal(rng.randint(3, 12)) / 100) if has_allowance else None
+    charge = rng.choice(FREIGHT) if has_charge else None
 
     net = subtotal - (allowance or Decimal(0)) + (charge or Decimal(0))
     total_excl_tax = q(net)
@@ -284,11 +293,23 @@ def render_b(doc: CanonicalDoc) -> str:
 
 RENDERERS = {Layout.A: render_a, Layout.B: render_b}
 
+#: How each layout PRINTS the date. Ground truth must agree with the page:
+#: the document shows a date, so doc_date_raw is not None. Without this the
+#: date check is never exercised by the corpus, and extraction is penalised
+#: for correctly reading a date that the answer key claims is absent.
+RAW_DATE = {
+    Layout.A: lambda d: d.strftime("%d %b %Y"),   # 02 May 2026
+    Layout.B: lambda d: d.isoformat(),            # 2026-05-02
+}
+
 
 def materialise(bundle: ChainBundle, layout: Layout) -> list[CanonicalDoc]:
     """Same semantic documents, rendered into one layout, source_text filled."""
     render = RENDERERS[layout]
-    return [d.model_copy(update={"source_text": render(d)}) for d in bundle.docs]
+    raw = RAW_DATE[layout]
+    return [d.model_copy(update={"source_text": render(d),
+                                 "doc_date_raw": raw(d.doc_date)})
+            for d in bundle.docs]
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -299,14 +320,27 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out", type=Path, default=Path("data/generated"))
     p.add_argument("--layouts", default="layout_a,layout_b")
+    p.add_argument("--clean", action="store_true",
+                   help="skip anomaly injection (A1 behaviour)")
     a = p.parse_args()
 
     layouts = [Layout(x.strip()) for x in a.layouts.split(",")]
     a.out.mkdir(parents=True, exist_ok=True)
     records, chains = [], []
 
+    from inject import inject_for_slot, needs_allowance, slot_for
+
     for i in range(a.n):
-        bundle = generate_chain(i, a.seed)
+        bundle = generate_chain(i, a.seed,
+                                force_allowance=needs_allowance(i))
+        if not a.clean:
+            rng = random.Random(a.seed * 7_000_003 + i)
+            docs, anomalies = inject_for_slot(slot_for(i), bundle.docs, rng)
+            bundle = ChainBundle(
+                chain_id=bundle.chain_id, docs=docs,
+                key=bundle.key.model_copy(update={
+                    "anomalies": anomalies,
+                    "doc_ids": [d.doc_id for d in docs]}))
         chains.append(bundle.key)
         cdir = a.out / bundle.chain_id
         cdir.mkdir(exist_ok=True)

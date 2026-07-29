@@ -125,6 +125,78 @@ def find_amounts(text: str) -> set[Decimal]:
     return out
 
 
+def count_occurrences(value: Decimal, text: str) -> int:
+    """How many numeric tokens in `text` equal `value`."""
+    return sum(1 for v in find_amounts(text) if v == value)
+
+
 def amount_in_source(value: Decimal, source_text: str) -> bool:
-    """Value-equality membership test, tolerant of rendering differences."""
-    return any(v == value for v in find_amounts(source_text))
+    """Value-equality membership test, tolerant of rendering differences.
+
+    NOTE: membership alone is too weak to ground a monetary claim — a
+    hallucinated total of 500.00 "appears" in a document that prints
+    `Qty 500`. Use unexplained_claims() for the real check; this remains for
+    callers that only need presence.
+    """
+    return count_occurrences(value, source_text) > 0
+
+
+def unexplained_claims(
+    claimed: Iterable[tuple[str, Decimal]],
+    non_monetary: Iterable[Decimal],
+    text: str,
+) -> list[tuple[str, Decimal]]:
+    """Monetary claims with no independent evidence in the source.
+
+    THE COUNTING ARGUMENT
+    ---------------------
+    A hallucinated amount often coincides with a number that is genuinely on
+    the page for another reason — a quantity, a year, a line number. Asking
+    "does this value appear?" cannot tell the two apart. Asking "does it
+    appear MORE OFTEN than the non-monetary fields already account for?" can.
+
+        hallucinated total 500.00, document prints only `Qty 500`
+            occurrences 1, explained by quantity 1  ->  0 left  ->  FAIL
+        genuine total, document prints `Qty 500 ... Total 500.00`
+            occurrences 2, explained by quantity 1  ->  1 left  ->  PASS
+
+    `non_monetary` is the values we already know are on the page for
+    non-monetary reasons: line quantities, and the components of the document
+    date. Every one of them is taken from the extracted record itself, so no
+    assumption is made about layout, currency symbols or label wording — the
+    reason the "look for a nearby $" approach was rejected.
+
+    Claims are de-duplicated BY VALUE, not by field: a Coupa-style purchase
+    order where subtotal, net and total are all 11100 prints that figure once
+    and is perfectly correct.
+    """
+    present = find_amounts_multiset(text)
+    explained: dict[Decimal, int] = {}
+    for v in non_monetary:
+        explained[v] = explained.get(v, 0) + 1
+
+    distinct: dict[Decimal, str] = {}
+    for path, value in claimed:
+        distinct.setdefault(value, path)
+
+    missing: list[tuple[str, Decimal]] = []
+    for value, path in distinct.items():
+        if present.get(value, 0) <= explained.get(value, 0):
+            missing.append((path, value))
+    return missing
+
+
+def find_amounts_multiset(text: str) -> dict[Decimal, int]:
+    """Every numeric value in `text` with its occurrence COUNT.
+
+    find_amounts() collapses duplicates into a set, which loses exactly the
+    information the counting argument needs.
+    """
+    out: dict[Decimal, int] = {}
+    for token in _AMOUNT_TOKEN.findall(text):
+        try:
+            v = parse_amount(token)
+        except AmbiguousAmountError:
+            continue
+        out[v] = out.get(v, 0) + 1
+    return out

@@ -1,0 +1,9 @@
+{
+  "auto_resolve_gate": "verify_pass",
+  "party_date_order": {
+    "Cobalt Office Interiors": "MDY",
+    "Averill Fastener GmbH": "DMY",
+    "Ridgeline HVAC Services": "MDY",
+    "Brightwell Labs Inc.": "MDY"
+  }
+}

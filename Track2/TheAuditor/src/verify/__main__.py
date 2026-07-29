@@ -17,8 +17,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import config
 from schemas import CheckOutcome, ExtractedRecord
-from ladder import CaseTrace, Rung, record, summarise
+from ladder import Phase, Rung, Scope, Trace, rung, span, summarise
 
 from .engine import verify_doc
 
@@ -62,22 +63,27 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     reports = []
-    traces: list[CaseTrace] = []
+    trace = Trace()
     n_docs = 0
     outcomes: Counter[str] = Counter()
     failed_docs = 0
 
     for path, rec in _iter_records(args.paths):
-        # Rung 0. A case that is STRICT here is resolved for free — it never
-        # reaches the GPU, and that is what the headline metric counts.
-        trace = CaseTrace(case_id=rec.doc.doc_id)
-        with record(trace, Rung.DETERMINISTIC) as ev:
-            report = verify_doc(rec.doc)
-            ev.resolved = report.strict_pass
-            ev.note = "strict pass" if report.strict_pass else (
-                "escalates: within-tolerance or unresolved"
-                if report.verify_pass else "escalates: failed check")
-        traces.append(trace)
+        # This CLI verifies documents in isolation, so each document is its
+        # own single-document case. The real pipeline groups by chain; the
+        # hierarchy is identical either way, which is the point of it.
+        with span(trace, Scope.CASE, rec.doc.doc_id) as case:
+            with span(trace, Scope.DOCUMENT, rec.doc.doc_id,
+                      parent=case) as dspan:
+                with rung(trace, Rung.DETERMINISTIC, dspan,
+                          phase=Phase.LADDER) as ev:
+                    report = verify_doc(rec.doc)
+                    gate = config.load().auto_resolve_gate
+                    ev.resolved_case = getattr(report, gate)
+                    ev.attributes["gate"] = gate
+                    ev.note = "strict pass" if report.strict_pass else (
+                        "escalates: within tolerance"
+                        if report.verify_pass else "escalates: failed check")
         reports.append(report)
         n_docs += 1
         for c in report.checks:
@@ -106,12 +112,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.trace:
         args.trace.parent.mkdir(parents=True, exist_ok=True)
-        args.trace.write_text(
-            "\n".join(t.model_dump_json() for t in traces) + "\n",
-            encoding="utf-8")
+        args.trace.write_text(trace.model_dump_json(indent=2),
+                              encoding="utf-8")
+
+    problems = trace.validate_coherence()
+    if problems:
+        print("\nTRACE INCOHERENT — metrics below are not trustworthy:")
+        for p in problems:
+            print(f"  ! {p}")
 
     print()
-    print(summarise(traces).render())
+    print(summarise(trace.summaries()).render())
     print(f"\n{n_docs} documents · "
           f"pass {outcomes[CheckOutcome.PASS]} · "
           f"within-tolerance {outcomes[CheckOutcome.WITHIN_TOLERANCE]} · "

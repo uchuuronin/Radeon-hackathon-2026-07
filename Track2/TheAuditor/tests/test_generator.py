@@ -169,15 +169,23 @@ def render_lines(layout: Layout) -> set[str]:
     return tokens
 
 
-def test_layouts_yield_identical_records_apart_from_source_text():
+def test_layouts_yield_identical_records_apart_from_rendering():
     """Same deal, two layouts, one verdict — the MAIN evidence for Leg 1.
-    If the records differ here, any downstream difference is the generator's
-    fault, not the model's."""
+    If the SEMANTIC content differed here, any downstream difference would be
+    the generator's fault rather than the model's.
+
+    source_text and doc_date_raw are excluded because they ARE the rendering:
+    one layout prints '02 May 2026' and the other '2026-05-02' for the same
+    doc_date. Everything that carries meaning must be byte-identical.
+    """
+    rendering = {"source_text", "doc_date_raw"}
     a = materialise(CHAINS[3], Layout.A)
     b = materialise(CHAINS[3], Layout.B)
     for da, db in zip(a, b):
-        assert (da.model_dump(exclude={"source_text"})
-                == db.model_dump(exclude={"source_text"}))
+        assert (da.model_dump(exclude=rendering)
+                == db.model_dump(exclude=rendering))
+        assert da.doc_date == db.doc_date        # meaning is identical
+        assert da.doc_date_raw != db.doc_date_raw  # rendering is not
 
 
 def test_layouts_state_different_precision():
@@ -202,3 +210,23 @@ def test_generator_emits_clean_chains_only():
         assert c.key.anomalies == []
         assert c.key.generator_seed == SEED
         assert set(c.key.doc_ids) == {d.doc_id for d in c.docs}
+
+
+def test_doc_date_raw_matches_what_the_layout_prints():
+    """The page shows a date, so ground truth must say so. Otherwise the date
+    check is dead on this corpus and extraction is penalised for reading it."""
+    from gen import RAW_DATE
+    for layout in (Layout.A, Layout.B):
+        for doc in materialise(CHAINS[0], layout):
+            assert doc.doc_date_raw == RAW_DATE[layout](doc.doc_date)
+            assert doc.doc_date_raw in doc.source_text
+
+
+def test_generated_dates_are_unambiguous_in_both_layouts():
+    """'02 May 2026' and '2026-05-02' both have exactly one reading, so the
+    corpus exercises the date check without manufacturing ambiguity noise."""
+    from normalise import read_date
+    for layout in (Layout.A, Layout.B):
+        for doc in materialise(CHAINS[0], layout):
+            r = read_date(doc.doc_date_raw)
+            assert r.unique == doc.doc_date and not r.ambiguous
