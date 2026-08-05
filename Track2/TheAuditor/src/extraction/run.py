@@ -1,4 +1,4 @@
-"""B4/B6 — drive extraction over a document set and record what it cost.
+"""Drive extraction over a document set and record what it cost.
 
 CONCURRENCY IS THE WHOLE OPTIMISATION HERE
 ------------------------------------------
@@ -39,7 +39,8 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from extraction.client import LocalVLLM, Usage                      # noqa: E402
+from extraction.client import (LocalVLLM, Usage, guided_mode,       # noqa: E402
+                               thinking_disabled)
 from extraction.prompt import (build_messages, guided_json_schema,  # noqa: E402
                                prefix_token_estimate, sanity_check)
 from schemas import (CanonicalDoc, ExtractedRecord, ExtractionMeta,  # noqa: E402
@@ -53,12 +54,44 @@ class RunStats:
     concurrency: int = 1
     documents: int = 0
     ok: int = 0
+    #: The model answered and the answer was not a valid CanonicalDoc.
     parse_failures: int = 0
+    #: The server did not answer at all. Kept SEPARATE from parse_failures on
+    #: purpose: "60 of 60 unparseable" reads in a sweep table as a model that
+    #: cannot extract, when the actual event was a server that fell over. One
+    #: is a finding about the model, the other is a finding about the run, and
+    #: conflating them is how a configuration gets wrongly eliminated.
+    api_errors: int = 0
+    #: max_tokens cut the JSON off mid-object. Also presents as a parse
+    #: failure, and is also not the model's fault.
+    truncated: int = 0
+    guided: str = ""
+    thinking_disabled: bool = True
     wall_s: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
     latencies_ms: list[float] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    #: Every document SENT, successful or not. The scorer needs this to tell a
+    #: model failure from a document that was outside --limit.
+    doc_ids: list[str] = field(default_factory=list)
+
+    def as_manifest(self) -> dict:
+        """Everything a sweep row needs, INCLUDING the derived numbers.
+
+        `asdict` alone drops docs_per_s and cache_hit_rate, because they are
+        properties rather than fields, so the manifest would be missing the
+        two figures the run exists to produce.
+        """
+        d = {k: v for k, v in asdict(self).items() if k != "latencies_ms"}
+        lat = sorted(self.latencies_ms)
+        d.update(docs_per_s=round(self.docs_per_s, 3),
+                 cache_hit_rate=round(self.cache_hit_rate, 4),
+                 latency_p50_ms=round(statistics.median(lat), 1) if lat else 0.0,
+                 latency_p95_ms=round(lat[int(0.95 * (len(lat) - 1))], 1) if lat else 0.0,
+                 errors=self.errors[:20])
+        return d
 
     @property
     def docs_per_s(self) -> float:
@@ -77,7 +110,10 @@ class RunStats:
             "",
             f"  model            : {self.model}  (tier {self.tier})",
             f"  documents        : {self.ok} ok / {self.documents} "
-            f"({self.parse_failures} unparseable)",
+            f"({self.parse_failures} unparseable, {self.api_errors} api errors,"
+            f" {self.truncated} truncated)",
+            f"  decoding         : guided={self.guided}  "
+            f"thinking_disabled={self.thinking_disabled}",
             f"  wall clock       : {self.wall_s:.1f} s at concurrency "
             f"{self.concurrency}",
             f"  throughput       : {self.docs_per_s:.2f} docs/sec",
@@ -88,6 +124,15 @@ class RunStats:
             f"  prefix cache     : {self.cache_hit_rate:.1%} of prompt tokens "
             f"served from cache",
         ]
+        if self.truncated:
+            L.append(f"     ^ {self.truncated} responses hit max_tokens. Raise "
+                     f"--max-tokens; these are NOT extraction failures and "
+                     f"must not be scored as if they were.")
+        if self.api_errors:
+            L.append(f"     ^ {self.api_errors} calls never reached the model. "
+                     f"First distinct errors:")
+            for e in dict.fromkeys(self.errors[:3]):
+                L.append(f"       {e}")
         if self.prompt_tokens and self.cache_hit_rate < 0.30:
             L.append(f"     ^ LOW. The frozen prefix is ~{expected} tokens; if it "
                      f"were being reused this should be well above 50%.")
@@ -131,7 +176,8 @@ def _parse(raw: str, doc_id: str, source_text: str) -> Optional[CanonicalDoc]:
 
 def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
                  tier: Tier = Tier.FAST, concurrency: int = 8,
-                 guided: bool = True, prompt_id: str = "") -> tuple[
+                 guided: bool = True, prompt_id: str = "",
+                 max_tokens: Optional[int] = None) -> tuple[
                      list[ExtractedRecord], RunStats]:
     """docs: list of (doc_id, source_text, layout)."""
     problems = sanity_check(s for _, s, _ in docs[:20])
@@ -140,26 +186,34 @@ def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
 
     schema = guided_json_schema() if guided else None
     stats = RunStats(model=llm.model, tier=tier.value, concurrency=concurrency,
-                     documents=len(docs))
+                     documents=len(docs), doc_ids=[d[0] for d in docs])
     out: list[ExtractedRecord] = []
 
     def one(item):
         doc_id, source_text, layout = item
         try:
             texts, usage = llm.complete(build_messages(source_text),
-                                        guided_json=schema)
+                                        guided_json=schema,
+                                        max_tokens=max_tokens)
         except Exception as exc:                                # noqa: BLE001
-            return doc_id, None, Usage(), f"{type(exc).__name__}: {exc}"
-        return doc_id, _parse(texts[0], doc_id, source_text), usage, layout
+            return doc_id, None, Usage(), layout, f"{type(exc).__name__}: {exc}"
+        return (doc_id, _parse(texts[0], doc_id, source_text), usage, layout,
+                None)
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for doc_id, doc, usage, layout in pool.map(one, docs):
+        for doc_id, doc, usage, layout, err in pool.map(one, docs):
             stats.prompt_tokens += usage.prompt_tokens
             stats.completion_tokens += usage.completion_tokens
             stats.cached_tokens += usage.cached_tokens
+            if usage.truncated:
+                stats.truncated += 1
             if usage.latency_ms:
                 stats.latencies_ms.append(usage.latency_ms)
+            if err is not None:
+                stats.api_errors += 1
+                stats.errors.append(err)
+                continue
             if doc is None:
                 stats.parse_failures += 1
                 continue
@@ -170,6 +224,8 @@ def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
                                     prompt_id=prompt_id,
                                     layout=layout if isinstance(layout, str) else None)))
     stats.wall_s = time.perf_counter() - t0
+    stats.guided = guided_mode() if guided else "off"
+    stats.thinking_disabled = thinking_disabled()
     return out, stats
 
 
@@ -204,19 +260,19 @@ def main() -> None:
     p.add_argument("--no-guided", action="store_true",
                    help="disable guided JSON, to measure what it is worth")
     p.add_argument("--prompt-id", default="baseline")
+    p.add_argument("--max-tokens", type=int, default=1024)
     a = p.parse_args()
 
     docs = load_sources(a.records, a.limit, a.layout)
     llm = LocalVLLM(model=a.model, base_url=a.base_url)
     recs, stats = extract_many(docs, llm, Tier(a.tier), a.concurrency,
-                               not a.no_guided, a.prompt_id)
+                               not a.no_guided, a.prompt_id, a.max_tokens)
 
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text("\n".join(r.model_dump_json() for r in recs) + "\n",
                      encoding="utf-8")
     a.out.with_suffix(".manifest.json").write_text(
-        json.dumps({k: v for k, v in asdict(stats).items()
-                    if k != "latencies_ms"}, indent=2), encoding="utf-8")
+        json.dumps(stats.as_manifest(), indent=2), encoding="utf-8")
     print(stats.render())
     print(f"\n  wrote {len(recs)} records -> {a.out}")
 

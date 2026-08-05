@@ -1,4 +1,4 @@
-"""A1 generator correctness.
+"""Clean-chain generator correctness.
 
 The answer key is the deliverable, so the generator IS the ground truth. If it
 emits an internally inconsistent document by accident, every precision/recall
@@ -196,7 +196,7 @@ def test_layouts_state_different_precision():
     # Value equality across layouts is proven by the two tests above; here we
     # only assert the RENDERING differs. (A whole-document find_amounts()
     # comparison would also pick up dates and part numbers, which is exactly
-    # the false-positive surface noted in the A5 write-up.)
+    # the false-positive surface noted in the verifier write-up.)
     assert a.count(".00") > 0, "Layout A should state cent precision"
     assert b.count(".00") == 0, "Layout B should strip trailing zeros"
 
@@ -204,7 +204,8 @@ def test_layouts_state_different_precision():
 # --- the answer key ----------------------------------------------------------
 
 def test_generator_emits_clean_chains_only():
-    """A1 is clean chains. Anomaly injection is A3, layered on top. A
+    """Generation is clean chains. Anomaly injection is a separate pass,
+    layered on top. A
     generator that breaks documents by accident is unusable as ground truth."""
     for c in CHAINS:
         assert c.key.anomalies == []

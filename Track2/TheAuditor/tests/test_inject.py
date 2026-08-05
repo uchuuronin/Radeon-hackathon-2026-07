@@ -1,4 +1,4 @@
-"""A3 injection tests.
+"""Anomaly injection tests.
 
 The property that matters most: every injected document is INTERNALLY
 consistent and passes the whole verifier. The drift lives BETWEEN documents.

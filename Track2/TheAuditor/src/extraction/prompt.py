@@ -1,4 +1,4 @@
-"""Extraction prompt assembly — B4.
+"""Extraction prompt assembly.
 
 ONE JOB: build a prompt whose first four blocks are byte-identical on every
 call, so vLLM's prefix cache computes their KV once and reuses it for every
@@ -99,6 +99,44 @@ Reply with the JSON record and nothing else. No preamble, no explanation, no \
 markdown fence."""
 
 
+#: Fields of CanonicalDoc that the HARNESS supplies and the model must not.
+#:
+#: This is not tidiness, it is the single most expensive line in the file.
+#:
+#: ``doc_id`` is the opaque ground-truth handle the scorer joins on. The model
+#: cannot know it and must not be able to set it.
+#:
+#: ``source_text`` is the document itself. Both are required fields on
+#: CanonicalDoc, so handing the raw contract schema to guided decoding makes
+#: the grammar REQUIRE the model to re-emit the entire document inside its own
+#: JSON output, verbatim, having just been given it in the prompt. Measured on
+#: the canonical corpus that is 382 completion tokens per document instead of
+#: 204: 47% of every decode spent copying an input we already hold and then
+#: overwrite in `_parse` anyway. Decode is the serial, memory-bandwidth-bound
+#: half of inference, so it very nearly halves docs/sec, and docs/sec at a
+#: stated utilisation is the number the optimisation criterion is scored on.
+#: On the longer market fixtures it also risks running into max_tokens, which
+#: truncates the JSON, fails the parse, and reads in a sweep row as "this model
+#: cannot extract" rather than "the grammar asked for the wrong thing".
+HARNESS_SUPPLIED: tuple[str, ...] = ("doc_id", "source_text")
+
+
+def extraction_json_schema() -> dict:
+    """CanonicalDoc as the MODEL sees it: the contract minus what we supply.
+
+    Derived from `CanonicalDoc.model_json_schema()` rather than hand-written,
+    so it cannot drift from the contract. `additionalProperties: false` is
+    preserved: the model still may not invent a field, it simply is not asked
+    for the two it could not know.
+    """
+    schema = json.loads(json.dumps(CanonicalDoc.model_json_schema()))
+    for name in HARNESS_SUPPLIED:
+        schema.get("properties", {}).pop(name, None)
+    schema["required"] = [f for f in schema.get("required", [])
+                          if f not in HARNESS_SUPPLIED]
+    return schema
+
+
 def _schema_block() -> str:
     """The JSON Schema, from the one source of truth.
 
@@ -106,9 +144,14 @@ def _schema_block() -> str:
     runs and Python versions. An unstable dict order here would silently
     invalidate the prefix cache between processes, which is precisely the
     failure this whole module exists to prevent.
+
+    This is the SAME object handed to guided decoding. If the prompt showed
+    the full contract while the grammar allowed the reduced one, the model
+    would be instructed to emit fields the grammar forbids, which is the worst
+    of both: wasted prompt tokens teaching a shape that cannot be produced.
     """
-    schema = CanonicalDoc.model_json_schema()
-    return json.dumps(schema, sort_keys=True, indent=2, separators=(",", ": "))
+    return json.dumps(extraction_json_schema(), sort_keys=True, indent=2,
+                      separators=(",", ": "))
 
 
 #: Two examples, chosen to teach the rules most likely to be broken rather than
@@ -130,7 +173,7 @@ EXAMPLES: tuple[tuple[str, dict], ...] = (
         "\n"
         "Net total: 780\n",
         {
-            "doc_id": "", "doc_number": "PO-5690-A", "doc_type": "purchase_order",
+            "doc_number": "PO-5690-A", "doc_type": "purchase_order",
             "party_name": "Northwind Traders Ltd", "doc_date": "2026-05-14",
             "doc_date_raw": "14/05/2026", "currency": "GBP",
             "line_items": [
@@ -158,7 +201,7 @@ EXAMPLES: tuple[tuple[str, dict], ...] = (
         "VAT 20%          190.00\n"
         "Total EUR      1,140.00\n",
         {
-            "doc_id": "", "doc_number": "INV-0087", "doc_type": "invoice",
+            "doc_number": "INV-0087", "doc_type": "invoice",
             "party_name": "Averill Fastener GmbH", "doc_date": "2026-06-02",
             "doc_date_raw": "2026-06-02", "currency": "EUR",
             "line_items": [
@@ -216,11 +259,15 @@ def build_messages(source_text: str) -> list[dict]:
 def guided_json_schema() -> dict:
     """Grammar for vLLM's guided decoding. Extraction output ONLY.
 
+    The reduced view, so the grammar and the schema block in the prompt are the
+    same object and the model is never asked to reproduce the document it was
+    just handed. See HARNESS_SUPPLIED.
+
     Do not reuse this on the reconciliation step: constraining a reasoning
     step measurably degrades it, which is why reconciliation reasons free-form
     and formats afterwards as a separate call.
     """
-    return CanonicalDoc.model_json_schema()
+    return extraction_json_schema()
 
 
 def prefix_token_estimate(chars_per_token: float = 3.6) -> int:

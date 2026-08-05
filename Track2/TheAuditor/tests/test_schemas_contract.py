@@ -1,8 +1,8 @@
 """Contract tests for schemas.py — run with `pytest`, no GPU, no network.
 
-These are the automated version of Sync 1, question 3 ("does B's extraction
-JSONL deserialise into A's CanonicalDoc without errors?"). They run on every
-push instead of once at the sync.
+These answer the wire-contract question ("does extraction output deserialise
+into CanonicalDoc without errors?") on every push, rather than once by hand
+when the two halves are first joined.
 """
 
 import json

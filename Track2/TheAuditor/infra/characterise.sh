@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B1 — characterise the card and pin every version, in one pass.
+# Characterise the card and pin every version, in one pass.
 #
 # Run this FIRST on the Radeon instance, before serving anything. It writes
 # infra/versions.md, which becomes the README environment section and is a

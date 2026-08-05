@@ -1,4 +1,4 @@
-"""A6 — corrupted fixtures: one broken invariant each, named after the check
+"""Corrupted fixtures: one broken invariant each, named after the check
 that must fire.
 
 Pattern per the plan (and independently used by the K-1 document-intelligence

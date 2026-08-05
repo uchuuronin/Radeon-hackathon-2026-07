@@ -1,4 +1,5 @@
-"""TheAuditor — the frozen contract between Person A and Person B.
+"""TheAuditor — the frozen wire contract between the deterministic
+pipeline and the extraction tier.
 
 Track 2, AMD AI DevMaster Hackathon 2026.
 
@@ -7,24 +8,24 @@ RULES OF THIS FILE
 1. This is the ONLY shared interface in the project. Everything imports it;
    it imports nothing from the project.
 2. THE COMMIT IS THE VERSION. There is no version string to bump and no
-   compatibility list to maintain: one branch, two people, one consumer of
+   compatibility list to maintain: one branch, one consumer of
    this file. A number carried alongside the git history is a second answer
    to a question that already has one, and it is the answer that goes stale,
    because nothing fails when you forget to bump it. If you need to know what
    the contract said at some point, read the commit.
-3. Changes still need both signatures. The distinction that matters is COST,
+3. Changes are not unilateral. The distinction that matters is COST,
    not numbering:
      WIRE-BREAKING — any change to CanonicalDoc / LineItem / the answer-key
-       types. These alter the JSON Schema in B's extraction prompt, so the
+       types. These alter the JSON Schema in the extraction prompt, so the
        prefix cache is invalidated and affected benchmarks must be re-run.
-       Say so in the commit message. It is the only warning B gets.
+       Say so in the commit message. It is the only warning anyone gets.
      POLICY-ONLY — tolerance bands, helper functions, verifier-internal
-       shapes. No wire impact; B re-runs nothing.
+       shapes. No wire impact; nothing needs re-running.
 4. Wire format is JSON (JSONL for batches). Money and dates travel as
    STRINGS on the wire and are parsed to Decimal / date on load.
    JSON numbers are FORBIDDEN for money — floats hallucinate cents.
 5. `model_json_schema()` on these models is the single source of truth for
-   B's guided decoding (XGrammar guided_json). Do not hand-write a second
+   guided decoding (XGrammar guided_json). Do not hand-write a second
    JSON Schema anywhere.
 
 STANDARDS ALIGNMENT
@@ -40,7 +41,7 @@ quote-to-cash chain rather than the invoice alone.
 
 Field NAMES are deliberately plain English rather than standards jargon
 (`line_total`, not `line_net_amount`) because these names appear verbatim in
-B's extraction prompt, and natural wording extracts better. The comment
+the extraction prompt, and natural wording extracts better. The comment
 carries the standards mapping; the field name carries the readability.
 
 """
@@ -371,14 +372,14 @@ class ExtractionMeta(_Base):
 
 
 class ExtractedRecord(_Base):
-    """What B's pipeline actually emits, one per JSONL line:
+    """What the extraction pipeline emits, one per JSONL line:
     the doc plus its provenance."""
     doc: CanonicalDoc
     meta: ExtractionMeta
 
 
 # ---------------------------------------------------------------------------
-# Answer key (ground truth) — the deliverable of A3
+# Answer key (ground truth) — the deliverable of anomaly injection
 # ---------------------------------------------------------------------------
 
 class PlantedAnomaly(_Base):
@@ -574,7 +575,7 @@ class VerificationReport(_Base):
 
 
 # ---------------------------------------------------------------------------
-# Default tolerance policy — frozen with the schema so A's verifier and B's
+# Default tolerance policy — frozen with the schema so the verifier and the
 # accuracy scoring band the same way.
 # ---------------------------------------------------------------------------
 # DECIDE: confirm these two numbers in the session. Industry practice is a

@@ -1,4 +1,4 @@
-"""A3 — anomaly injection. Chain-level drift on top of clean chains.
+"""Anomaly injection — chain-level drift on top of clean chains.
 
 PaySim's model, applied to document chains: generate a clean baseline, then
 inject known bad behaviour so ground truth exists by construction. One
@@ -16,7 +16,8 @@ precisely why the reconciler must exist: rung 0 cannot see these by design,
 and tests/test_inject.py asserts it.
 
 The exception is nothing: even the near-duplicate is a coherent invoice.
-Doc-level corruption (extraction errors) is A6's job, already done.
+Doc-level corruption (extraction errors) belongs to the corrupted fixtures,
+already done.
 
 DECOYS, AND WHY THEY ARE PLACED WHERE THEY ARE
 ---------------------------------------------

@@ -1,4 +1,4 @@
-"""A5 + A6 tests.
+"""Verifier and corrupted-fixture tests.
 
 The two-sided contract that makes the verifier trustworthy:
   RECALL side  — every corrupted fixture trips the check it is named after.
@@ -192,7 +192,8 @@ def test_whole_unit_fixture_arithmetic_is_exact():
 
 
 def test_pair_checks_pass_on_the_designed_relationships():
-    """F3 (SAP PO) precedes F9 (GRN); same vendor. Built into A4 for this."""
+    """F3 (SAP PO) precedes F9 (GRN); same vendor. Built into the fixtures
+    for this."""
     by = {p.stem.split("_")[0]: load(p).doc for p in CLEAN}
     results = verify_pair(by["F-0003"], by["F-0009"])
     assert all(c.outcome == CheckOutcome.PASS for c in results)
@@ -325,7 +326,7 @@ def test_cli_exits_zero_on_clean_and_nonzero_on_corrupted(tmp_path):
 
 
 def test_pair_corrupted_fixture_fires_party_names_match():
-    """A6 completeness: party_names_match is pair-level, so its corrupted
+    """Corrupted-fixture completeness: party_names_match is pair-level, so its
     fixture is a PAIR — a lookalike vendor on the GRN against the real PO."""
     import json
     pair = json.loads((FIXDIR / "corrupted" /

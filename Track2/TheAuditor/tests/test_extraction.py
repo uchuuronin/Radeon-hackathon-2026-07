@@ -1,4 +1,4 @@
-"""B-side harness tests. No GPU, no network, no openai package required.
+"""Extraction-harness tests. No GPU, no network, no openai package required.
 
 These exist because every one of them guards a failure that is SILENT on the
 instance: a prefix that stops being reused, an endpoint that is not local, a
@@ -18,10 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bench.score import Score, score_doc                        # noqa: E402
 from extraction.client import LocalVLLM, _assert_local          # noqa: E402
-from extraction.prompt import (DOC_CLOSE, DOC_OPEN, PREFIX,     # noqa: E402
-                               build_messages, build_prompt,
-                               guided_json_schema, sanity_check)
-from extraction.run import _parse                               # noqa: E402
+from extraction.prompt import (DOC_CLOSE, DOC_OPEN, HARNESS_SUPPLIED,  # noqa: E402
+                               PREFIX, build_messages, build_prompt,
+                               extraction_json_schema, guided_json_schema,
+                               sanity_check)
+from extraction.run import RunStats, _parse                     # noqa: E402
 from schemas import CanonicalDoc, DocType, LineItem             # noqa: E402
 from datetime import date                                       # noqa: E402
 
@@ -114,7 +115,8 @@ class TestLocalityIsEnforcedNotPromised:
             LocalVLLM(model="m", base_url="https://api.openai.com/v1")
 
     def test_client_imports_without_the_openai_package(self):
-        """A's half must stay runnable on a laptop with no model client."""
+        """The deterministic half must stay runnable on a laptop with no model
+        client."""
         LocalVLLM(model="m")            # no network, no import of openai
 
 
@@ -139,8 +141,85 @@ class TestOutputParsing:
     def test_garbage_returns_none_rather_than_raising(self):
         assert _parse("I'm sorry, I can't help with that.", "D-1", "s") is None
 
-    def test_guided_schema_comes_from_the_contract(self):
-        assert guided_json_schema() == CanonicalDoc.model_json_schema()
+    def test_guided_schema_is_the_contract_minus_what_we_supply(self):
+        """The grammar must not require the model to re-emit the document.
+
+        `source_text` and `doc_id` are required on CanonicalDoc, so handing
+        the raw contract to guided decoding forces the model to transcribe the
+        whole input back inside its own JSON, having just been given it, only
+        for `_parse` to overwrite both. Measured on the canonical corpus that
+        is 382 completion tokens per document against 204: 47% of every decode
+        spent copying an input we already hold, on the serial half of
+        inference, against the one metric the optimisation criterion scores.
+        """
+        contract = CanonicalDoc.model_json_schema()
+        got = guided_json_schema()
+        assert got == extraction_json_schema()
+        for name in HARNESS_SUPPLIED:
+            assert name in contract["properties"], "field left the contract"
+            assert name not in got["properties"]
+            assert name not in got["required"]
+        # Everything else is untouched, so the grammar cannot drift from the
+        # contract by anything other than this deliberate subtraction.
+        assert set(got["properties"]) | set(HARNESS_SUPPLIED) \
+            == set(contract["properties"])
+        assert got["additionalProperties"] is False
+
+    def test_the_prompt_shows_the_same_schema_the_grammar_enforces(self):
+        """Showing the full contract while enforcing the reduced one would
+        teach a shape the model physically cannot produce, and pay prompt
+        tokens for the privilege."""
+        import json as _json
+        block = _json.dumps(extraction_json_schema(), sort_keys=True, indent=2,
+                            separators=(",", ": "))
+        assert block in PREFIX
+
+    def test_examples_validate_against_the_grammar(self):
+        """A few-shot that the grammar forbids is worse than no few-shot: it
+        teaches the model to emit something guided decoding will refuse."""
+        from extraction.prompt import EXAMPLES
+        allowed = set(extraction_json_schema()["properties"])
+        required = set(extraction_json_schema()["required"])
+        for _src, rec in EXAMPLES:
+            assert set(rec) <= allowed, set(rec) - allowed
+            assert required <= set(rec), required - set(rec)
+
+
+class TestRunLevelFailuresAreNotModelFailures:
+    """A sweep row eliminates a configuration. It must not eliminate one for
+    something the configuration did not do."""
+
+    def test_api_errors_are_counted_apart_from_parse_failures(self):
+        """"60 of 60 unparseable" reads as a model that cannot extract. If the
+        actual event was a server that fell over, that is the opposite
+        finding, and conflating them discards a configuration on noise."""
+        st = RunStats(documents=2, api_errors=1, parse_failures=1,
+                      errors=["ConnectionError: refused"])
+        out = st.render()
+        assert "1 api errors" in out and "1 unparseable" in out
+        assert "never reached the model" in out
+        assert "ConnectionError: refused" in out
+
+    def test_truncation_is_reported_as_truncation(self):
+        """max_tokens cutting the JSON off presents downstream as an
+        unparseable record. Reported as such it would be read as the model
+        failing at extraction rather than as a ceiling we set."""
+        st = RunStats(documents=1, truncated=1, parse_failures=1)
+        assert "max_tokens" in st.render()
+
+    def test_manifest_carries_the_derived_numbers(self):
+        """`asdict` alone drops docs_per_s and cache_hit_rate, because they
+        are properties, so the manifest would omit the two figures the run
+        exists to produce."""
+        st = RunStats(ok=4, documents=4, wall_s=2.0, prompt_tokens=100,
+                      cached_tokens=90, latencies_ms=[10.0, 20.0, 30.0],
+                      doc_ids=["D-1", "D-2"])
+        m = st.as_manifest()
+        assert m["docs_per_s"] == 2.0
+        assert m["cache_hit_rate"] == 0.9
+        assert m["latency_p50_ms"] == 20.0
+        assert m["doc_ids"] == ["D-1", "D-2"]
+        assert "latencies_ms" not in m
 
 
 class TestScorerMeasuresTheRightThing:
@@ -203,3 +282,49 @@ class TestScorerMeasuresTheRightThing:
         s = self._pair()
         p, lo, hi = s.rate("line_numeric")
         assert lo <= p <= hi and lo > 0.0
+
+    def test_unsent_documents_are_not_parse_failures(self):
+        """A sweep sends --limit 60 against a 6180-document corpus. Counting
+        the other 6120 as failures would print a headline number that is pure
+        artefact of the limit and says nothing about the model."""
+        import json as _json
+        from bench.score import score_files
+        import tempfile
+
+        truth = _doc(line_items=[])
+        other = _doc(doc_id="T-2", line_items=[])
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / "records.jsonl"
+            gp = Path(d) / "extracted.jsonl"
+            tp.write_text("\n".join(
+                _json.dumps({"doc": _json.loads(x.model_dump_json()),
+                             "meta": {"layout": "layout_a"}})
+                for x in (truth, other)) + "\n", encoding="utf-8")
+            gp.write_text(_json.dumps(
+                {"doc": _json.loads(truth.model_dump_json()),
+                 "meta": {"layout": "layout_a"}}) + "\n", encoding="utf-8")
+
+            s = score_files(tp, gp, layout="layout_a", attempted={"T-1"})
+            assert s.parse_failures == 0
+            assert s.not_attempted == 1
+            assert s.docs == 1
+
+            # And a document that WAS sent and came back nothing is still a
+            # failure, or the counter would forgive the thing it exists for.
+            s2 = score_files(tp, gp, layout="layout_a",
+                             attempted={"T-1", "T-2"})
+            assert s2.parse_failures == 1
+
+    def test_a_row_states_its_mode_and_n(self):
+        """A row missing either cannot be compared to another row."""
+        s = self._pair()
+        row = s.row("qwen3-8b x awq-int4", {"ok": 1, "documents": 1,
+                                            "docs_per_s": 3.0,
+                                            "cache_hit_rate": 0.9,
+                                            "guided": "guided_json"},
+                    mode="relaxed", vram_gb=21.4, utilisation=82)
+        assert "relaxed" in row and "82%" in row and "21.4 GB" in row
+        assert str(s.n["line_numeric"]) in row
+        # Throughput without its utilisation is not a systems result, so the
+        # absence is stated in the cell rather than left blank.
+        assert "UTILISATION NOT RECORDED" in s.row("x", {"docs_per_s": 3.0})
