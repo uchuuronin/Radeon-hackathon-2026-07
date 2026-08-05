@@ -1,27 +1,34 @@
 """TheAuditor — the frozen contract between Person A and Person B.
 
-Track 2, AMD AI DevMaster Hackathon 2026.        SCHEMA_VERSION = "1.2"
+Track 2, AMD AI DevMaster Hackathon 2026.
 
 RULES OF THIS FILE
 ------------------
 1. This is the ONLY shared interface in the project. Everything imports it;
    it imports nothing from the project.
-2. After both people sign off, changes require BOTH signatures and a bump of
-   SCHEMA_VERSION. Distinguish two kinds:
+2. THE COMMIT IS THE VERSION. There is no version string to bump and no
+   compatibility list to maintain: one branch, two people, one consumer of
+   this file. A number carried alongside the git history is a second answer
+   to a question that already has one, and it is the answer that goes stale,
+   because nothing fails when you forget to bump it. If you need to know what
+   the contract said at some point, read the commit.
+3. Changes still need both signatures. The distinction that matters is COST,
+   not numbering:
      WIRE-BREAKING — any change to CanonicalDoc / LineItem / the answer-key
        types. These alter the JSON Schema in B's extraction prompt, so the
        prefix cache is invalidated and affected benchmarks must be re-run.
+       Say so in the commit message. It is the only warning B gets.
      POLICY-ONLY — tolerance bands, helper functions, verifier-internal
-       shapes. No wire impact; B re-runs nothing. Record it in WIRE_COMPATIBLE_WITH.
-3. Wire format is JSON (JSONL for batches). Money and dates travel as
+       shapes. No wire impact; B re-runs nothing.
+4. Wire format is JSON (JSONL for batches). Money and dates travel as
    STRINGS on the wire and are parsed to Decimal / date on load.
    JSON numbers are FORBIDDEN for money — floats hallucinate cents.
-4. `model_json_schema()` on these models is the single source of truth for
+5. `model_json_schema()` on these models is the single source of truth for
    B's guided decoding (XGrammar guided_json). Do not hand-write a second
    JSON Schema anywhere.
 
-STANDARDS ALIGNMENT (v1.1)
---------------------------
+STANDARDS ALIGNMENT
+-------------------
 Field semantics follow EN 16931 (CEN/TC 434), the European semantic data
 model for e-invoicing. We borrow the *meaning and the arithmetic invariants*,
 not the XML syntax — we are not claiming EN 16931 conformance. BT-xxx
@@ -36,7 +43,6 @@ Field NAMES are deliberately plain English rather than standards jargon
 B's extraction prompt, and natural wording extracts better. The comment
 carries the standards mapping; the field name carries the readability.
 
-Decision points still open for the 45-min session are marked  # DECIDE:
 """
 
 from __future__ import annotations
@@ -44,34 +50,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Optional, Sequence
+from contextvars import ContextVar
+from typing import Literal, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from precision import inferred_tolerance
-
-SCHEMA_VERSION = "1.2"
-
-# Versions whose WIRE FORMAT this schema can still read. The freeze protects
-# the interchange types; internal policy (tolerance bands, helper functions)
-# may evolve without a wire break. B only has to re-run benchmarks when a
-# version leaves this list.
-WIRE_COMPATIBLE_WITH = ("1.2",)
-
-# --- CHANGELOG ---------------------------------------------------------------
-# 1.2  WIRE-BREAKING. Discovered by building the generator (A1):
-#      - LineItem.unit_price / line_total are now Optional. A goods receipt
-#        legitimately records quantities with no prices; forcing 0 there would
-#        have violated the never-zero-for-absent rule and made partial-shipment
-#        detection impossible.
-#      - CanonicalDoc.doc_number added. Documents reference each other by the
-#        identifier PRINTED ON THE PAGE, which cannot be doc_id: doc_id is
-#        deliberately opaque so the linker cannot cheat. Both are needed.
-#      Policy-only (no wire impact): precision-inferred tolerance,
-#      Tolerance.inferred_multiplier, CheckResult.field_path.
-# 1.1  EN 16931 alignment, tolerance model, line_id, UBL doc types.
-# 1.0  Initial contract.
-
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -102,7 +86,7 @@ class AnomalyType(str, Enum):
     NEAR_DUPLICATE = "near_duplicate"          # one digit changed
     UNAPPLIED_DISCOUNT = "unapplied_discount"  # allowance on PO, absent on invoice
     TERM_CHANGE = "term_change"                # non-numeric
-    PARTIAL_SHIPMENT = "partial_shipment"      # v1.1: invoice > goods receipt.
+    PARTIAL_SHIPMENT = "partial_shipment"      # invoice > goods receipt.
     # PARTIAL_SHIPMENT is the canonical hard case in real AP (ship 480 of 500,
     # invoice all 500). Worth more than a sixth synthetic variant.
 
@@ -131,7 +115,7 @@ class ScoringMode(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Tolerance model  (v1.1 — new)
+# Tolerance model
 # ---------------------------------------------------------------------------
 # Real AP systems do not use exact equality. Standard industry practice is a
 # PERCENTAGE combined with an ABSOLUTE CAP (e.g. 2% up to $100), because a
@@ -171,6 +155,21 @@ class Tolerance(_Base):
         description="Buffer applied to precision-inferred tolerance. Mirrors "
                     "Beancount's inferred_tolerance_multiplier; 1.1 is its "
                     "documented recommendation.")
+    mode: Literal["rss", "linear"] = Field(
+        default="rss",
+        description="How half-ULPs accumulate across the operands of an "
+                    "identity. 'rss' is the independent-error bound "
+                    "(sqrt of sum of squares, grows as sqrt(N)); 'linear' is "
+                    "the worst-case aligned-error ceiling (grows as N) and is "
+                    "twice as wide at four operands. Default rss: linear "
+                    "would absorb a genuine one-cent-per-line error across "
+                    "four lines. Every tolerance figure reported must name "
+                    "the mode that produced it.")
+
+
+#: When True, `allowed_delta` ignores stated precision and allows only the
+#: absolute floor. See the note on allowed_delta.
+STRICT_PRECISION = ContextVar("STRICT_PRECISION", default=False)
 
 
 def allowed_delta(
@@ -185,16 +184,37 @@ def allowed_delta(
     `rendered` is the list of amount strings AS THE DOCUMENT PRINTED THEM,
     for every operand in the identity being checked. When supplied, the
     floor becomes the precision the document actually committed to rather
-    than a fixed constant. Omit it and behaviour is the v1.1 fixed floor,
+    than a fixed constant. Omit it and behaviour falls back to the fixed floor,
     so existing callers are unaffected.
     """
     band = abs(reference) * tol.pct
     if tol.abs_cap is not None:
         band = min(band, tol.abs_cap)
 
+    # TWO DEFENSIBLE READINGS OF A STATED AMOUNT, AND THEY DISAGREE
+    # ------------------------------------------------------------
+    # Default (inference): "250" is a value someone rounded, so it stands for
+    #   anything in [249.5, 250.5) and the band widens accordingly. Correct for
+    #   documents of unknown provenance, which is what an extraction pipeline
+    #   handles: the precision a document prints is the only evidence we have
+    #   about the precision it kept.
+    # Strict: "250" is exactly 250. Correct for a conformant e-invoice, where
+    #   the standard already constrains amounts to two decimals and treats what
+    #   is printed as the value.
+    #
+    # This is not a hedge. Running CEN's own rule fixtures against us showed the
+    # two readings disagree on real cases: their BR-CO-15 fixture states tax as
+    # "250" and a gross total one cent off, and calls it an error, while
+    # inference gives a band of 0.55 because "250" could have been 249.5. Both
+    # verdicts are right for their own context, so the context is now selectable
+    # rather than assumed, and bench/conformance.py reports both.
+    if STRICT_PRECISION.get():
+        return max(band, tol.abs_floor)
+
     floor = tol.abs_floor
     if rendered:
-        inferred = inferred_tolerance(rendered, tol.inferred_multiplier)
+        inferred = inferred_tolerance(rendered, tol.inferred_multiplier,
+                                      mode=tol.mode)
         floor = max(floor, inferred)
     return max(band, floor)
 
@@ -290,6 +310,12 @@ class CanonicalDoc(_Base):
         default=None, description="Total VAT amount (BT-110).")
     total: Optional[Decimal] = Field(
         default=None, description="Total amount with VAT (BT-112).")
+    paid_amount: Optional[Decimal] = Field(
+        default=None,
+        description="BT-113. Already-settled amount on this invoice. Absent "
+                    "means nothing has been paid, which is NOT the same as a "
+                    "stated zero: a document that prints 'Paid: 0.00' is "
+                    "asserting it, and one that says nothing is not.")
     rounding_amount: Optional[Decimal] = Field(
         default=None,
         description="Explicit rounding adjustment (BT-114). Some vendors "
@@ -331,8 +357,11 @@ class ExtractionMeta(_Base):
     so it exists now, even while mostly unused."""
     model_id: str = ""                # e.g. "Qwen3-14B-GPTQ-int8"
     tier: Tier = Tier.NONE
-    prompt_version: str = ""          # bump when B changes the prompt
-    schema_version: str = SCHEMA_VERSION
+    prompt_id: str = ""
+    # A NAME, not a number. "v3" tells you nothing about what changed and
+    # invites the same rot as a schema version; "grounded-anchors-fewshot-4"
+    # tells you what you were testing when the sweep row was recorded. B sets
+    # it freely and it only has to be unique within a run.
     extraction_ts: Optional[datetime] = None
     n_sample_index: Optional[int] = Field(
         default=None,
@@ -366,7 +395,7 @@ class PlantedAnomaly(_Base):
                     "None for non-numeric anomalies (term_change).")
     is_within_tolerance: bool = Field(
         default=False,
-        description="v1.1: TRUE for drifts planted deliberately BELOW the "
+        description="TRUE for drifts planted deliberately BELOW the "
                     "tolerance band. The system must NOT flag these. This is "
                     "how we measure precision honestly — a system that flags "
                     "everything scores perfect recall and useless precision.")
@@ -395,7 +424,6 @@ class ChainKey(_Base):
 
 
 class AnswerKey(_Base):
-    schema_version: str = SCHEMA_VERSION
     chains: list[ChainKey]
 
 
@@ -422,6 +450,22 @@ class CheckName(str, Enum):
     LINE_NET_AMOUNT = "line_net_amount_identity"
     # quantity * unit_price - line_allowance == line_total   (BT-131 defn)
 
+    BR_CO_16 = "br_co_16_amount_due_identity"
+    # BT-115 = BT-112 - BT-113 + BT-114. The settlement identity, and the one
+    # a payment chain actually turns on: it is what says "this invoice was
+    # part-paid and this is what remains", which is exactly the state a
+    # reconciliation engine exists to reason about. We had amount_due and
+    # rounding_amount already; only the paid amount was missing.
+
+    BR_DEC_MAX_2 = "br_dec_amounts_max_2_decimals"
+    # Every monetary BT is capped at two decimals by its own BR-DEC rule
+    # (BR-DEC-09 BT-106, -12 BT-109, -13 BT-110, -14 BT-112, -17 BT-114,
+    #  -23 BT-131, and so on). One check covers the family because the
+    #  constraint is identical and the Decimal exponent already carries it,
+    #  so this costs no wire change. NOTE the family constrains AMOUNTS only:
+    #  there is no BR-DEC rule on quantities or VAT rates, so quantity is
+    #  deliberately not checked here.
+
     # --- Ours, no standards backing ---
     AMOUNTS_APPEAR_IN_SOURCE = "amounts_appear_in_source"
     DATES_PARSE_AND_ORDER = "dates_parse_and_order"
@@ -435,7 +479,16 @@ class CheckOutcome(str, Enum):
     PASS = "pass"                          # exact
     WITHIN_TOLERANCE = "within_tolerance"  # differs, but inside the band
     FAIL = "fail"
-    SKIPPED = "skipped"                    # inputs absent (e.g. no tax field)
+    SKIPPED = "skipped"
+    # NOT APPLICABLE to this document. A payment has no line items, so
+    # BR-CO-10 cannot mean anything: neutral, and correctly so.
+    INPUTS_MISSING = "inputs_missing"
+    # The check COULD have applied and the field was not supplied. Neutral
+    # for pass/fail (we cannot assert a document is wrong on evidence we do
+    # not have) but it counts against COVERAGE, because otherwise an
+    # extractor that emits fewer fields buys itself a cheaper verification.
+    # That is the unevaluable-assertion gaming hole, and it is a real one:
+    # the cheapest way to a clean report would be to extract nothing.
 
 
 class CheckResult(_Base):
@@ -467,7 +520,6 @@ class CheckResult(_Base):
 
 class VerificationReport(_Base):
     doc_id: str
-    schema_version: str = SCHEMA_VERSION
     checks: list[CheckResult]
     rounding_policy: str = Field(
         default="aggregate",
@@ -480,8 +532,34 @@ class VerificationReport(_Base):
     @property
     def verify_pass(self) -> bool:
         """The deterministic component of Mechanism B's confidence signal.
-        Within-tolerance counts as a pass; skipped checks are neutral."""
+        Within-tolerance counts as a pass; neither neutral state fails.
+
+        DELIBERATELY UNCHANGED by 1.3. INPUTS_MISSING does not fail a
+        document, because the routing threshold was measured against this
+        definition and silently moving it would invalidate every number
+        already recorded. Coverage is reported ALONGSIDE, not folded in.
+        """
         return not any(c.outcome == CheckOutcome.FAIL for c in self.checks)
+
+    @property
+    def field_coverage(self) -> tuple[int, int]:
+        """(evaluated, evaluable) — the anti-gaming counter.
+
+        Evaluable = every check except the not-applicable ones. Evaluated =
+        those that actually ran. A document whose extractor dropped fields
+        scores a high verify_pass and a LOW coverage, and the gap is exactly
+        the thing a reviewer should look at.
+        """
+        evaluable = [c for c in self.checks
+                     if c.outcome != CheckOutcome.SKIPPED]
+        evaluated = [c for c in evaluable
+                     if c.outcome != CheckOutcome.INPUTS_MISSING]
+        return len(evaluated), len(evaluable)
+
+    @property
+    def evaluable_pct(self) -> float:
+        done, total = self.field_coverage
+        return 100.0 * done / total if total else 100.0
 
     @property
     def strict_pass(self) -> bool:
@@ -489,7 +567,8 @@ class VerificationReport(_Base):
         high-confidence tier of the routing rule; verify_pass alone is the
         low bar."""
         applicable = [c for c in self.checks
-                      if c.outcome != CheckOutcome.SKIPPED]
+                      if c.outcome not in (CheckOutcome.SKIPPED,
+                                           CheckOutcome.INPUTS_MISSING)]
         return bool(applicable) and all(
             c.outcome == CheckOutcome.PASS for c in applicable)
 
@@ -503,25 +582,49 @@ class VerificationReport(_Base):
 #         2% / $100 and tighten the pure-arithmetic identities, which should
 #         hold to the cent on a well-formed document.
 
+#: The smallest band that is never wider than the smallest real error.
+#:
+#: This was 0.01 and that was a bug, found by running the standard
+#: maintainers' own rule fixtures against our verifier. A band of exactly one
+#: cent makes a one-cent discrepancy UNDETECTABLE, because the comparison is
+#: inclusive: delta 0.01 <= band 0.01 passes. One cent is the smallest
+#: meaningful unit of financial error, so the floor was set precisely where it
+#: blinded us. CEN's BR-CO-10 fixture states a subtotal of 200.01 against lines
+#: of 110.00 + 90.00 and declares it an error; we called it within tolerance.
+#:
+#: 0.005 is a half-ULP at cent precision, which is the same quantity
+#: precision.py infers for a single amount stated to two decimals, so the floor
+#: is now consistent with the inference model rather than a round number
+#: someone liked.
+HALF_CENT = Decimal("0.005")
+
 DEFAULT_TOLERANCES: dict[CheckName, Tolerance] = {
     # Internal arithmetic must be near-exact — a document that does not add
     # up internally is a genuine extraction or authoring error.
     CheckName.BR_CO_10:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=Decimal("0.01")),
+                                   abs_floor=HALF_CENT),
     CheckName.BR_CO_13:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=Decimal("0.01")),
+                                   abs_floor=HALF_CENT),
     CheckName.BR_CO_15:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=Decimal("0.01")),
+                                   abs_floor=HALF_CENT),
     CheckName.LINE_NET_AMOUNT: Tolerance(pct=Decimal("0"),
                                          abs_cap=Decimal("0.05"),
-                                         abs_floor=Decimal("0.01")),
+                                         abs_floor=HALF_CENT),
+    # BR-DEC is a digit-count rule, not a magnitude rule. It never calls
+    # allowed_delta; the entry exists so every CheckName has a policy row.
+    CheckName.BR_CO_16: Tolerance(pct=Decimal("0"),
+                                  abs_cap=Decimal("0.05"),
+                                  abs_floor=HALF_CENT),
+    CheckName.BR_DEC_MAX_2: Tolerance(pct=Decimal("0"),
+                                      abs_cap=Decimal("0"),
+                                      abs_floor=Decimal("0")),
 }
 
 # Cross-document comparison is where real tolerance lives (PO vs invoice vs
 # goods receipt). The reconciler, not the verifier, applies these.
 CROSS_DOC_TOLERANCE = Tolerance(pct=Decimal("0.02"),
                                 abs_cap=Decimal("100.00"),
-                                abs_floor=Decimal("0.01"))
+                                abs_floor=HALF_CENT)
 
 
 # ---------------------------------------------------------------------------

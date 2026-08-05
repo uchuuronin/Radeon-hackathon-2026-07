@@ -1,4 +1,4 @@
-"""Contract tests for schemas.py v1.1 — run with `pytest`, no GPU, no network.
+"""Contract tests for schemas.py — run with `pytest`, no GPU, no network.
 
 These are the automated version of Sync 1, question 3 ("does B's extraction
 JSONL deserialise into A's CanonicalDoc without errors?"). They run on every
@@ -15,7 +15,6 @@ from pydantic import ValidationError
 from schemas import (
     CROSS_DOC_TOLERANCE,
     DEFAULT_TOLERANCES,
-    SCHEMA_VERSION,
     AnomalyType,
     AnswerKey,
     CanonicalDoc,
@@ -37,7 +36,7 @@ from schemas import (
 
 
 def make_fixture_doc() -> CanonicalDoc:
-    """A discounted invoice with freight — the case v1.0 got wrong.
+    """A discounted invoice with freight — the case the naive identity gets wrong.
 
     lines            4500.00 + 300.00 = 4800.00      (subtotal, BT-106)
     allowance                          -  480.00     (BT-107, 10% discount)
@@ -118,10 +117,10 @@ def test_json_schema_exports_for_guided_decoding():
     assert "allowance_total" in schema["properties"]
 
 
-# --- EN 16931 identities: the v1.0 bug --------------------------------------
+# --- EN 16931 identities: the naive-identity bug ----------------------------
 
 def test_naive_subtotal_plus_tax_identity_is_wrong_on_discounted_doc():
-    """Guards the v1.0 bug. A discounted+freighted document is LEGITIMATE but
+    """Guards the naive identity. A discounted+freighted document is LEGITIMATE but
     fails subtotal + tax == total. If this assertion ever flips, someone has
     reverted to the naive identity and the verifier will false-positive on
     every discounted invoice."""
@@ -153,9 +152,26 @@ def test_percentage_applies_below_the_cap():
     assert allowed_delta(Decimal("50.00"), CROSS_DOC_TOLERANCE) == Decimal("1.00")
 
 
-def test_floor_prevents_flagging_a_cent():
+def test_floor_is_below_one_cent_so_one_cent_is_detectable():
+    """This test previously asserted the opposite, and was wrong.
+
+    It read "floor prevents flagging a cent" and locked the floor at 0.01,
+    which made a one-cent discrepancy undetectable on every within-document
+    identity: the comparison is inclusive, so delta 0.01 <= band 0.01 passed.
+    One cent is the smallest meaningful financial error and the floor sat
+    exactly where it blinded us.
+
+    Nothing in this suite could have caught that, because the suite and the
+    verifier were written from the same assumption. It surfaced when CEN's own
+    BR-CO-10 fixture (subtotal 200.01 against lines of 110.00 + 90.00, declared
+    an error by the standard's maintainers) came back green from our verifier.
+
+    0.005 is a half-ULP at cent precision, so the floor now agrees with the
+    inference model instead of being a round number.
+    """
     tol = DEFAULT_TOLERANCES[CheckName.BR_CO_10]
-    assert allowed_delta(Decimal("0.10"), tol) == Decimal("0.01")
+    assert allowed_delta(Decimal("0.10"), tol) == Decimal("0.005")
+    assert Decimal("0.01") > allowed_delta(Decimal("0.10"), tol)
 
 
 def test_uncapped_tolerance_is_allowed():
@@ -234,11 +250,23 @@ def test_absent_amounts_are_none_not_zero():
     assert payment.allowance_total is None
 
 
-def test_wire_compatibility_is_declared():
-    """A 1.2 reader must state which wire versions it accepts, so a records
-    file tagged with an older version fails loudly instead of silently."""
-    from schemas import WIRE_COMPATIBLE_WITH
-    assert SCHEMA_VERSION in WIRE_COMPATIBLE_WITH
+def test_the_contract_carries_no_version_of_its_own():
+    """The commit is the version.
+
+    A version string beside a git history is a second answer to a question
+    that already has one, and it is the answer that rots, because nothing
+    fails when you forget to bump it. This test is the guard on that: if a
+    schema_version, contract_version or similar reappears, it will be because
+    someone added it by reflex rather than because the project grew a second
+    consumer that needs it.
+    """
+    import schemas
+    banned = {"SCHEMA_VERSION", "WIRE_COMPATIBLE_WITH", "CONTRACT_VERSION"}
+    assert not (banned & set(vars(schemas))), (
+        "the contract grew a version constant; the commit is the version")
+    for model in (ExtractedRecord, ExtractionMeta, CanonicalDoc, LineItem):
+        fields = set(model.model_fields)
+        assert not {f for f in fields if "schema_version" in f}, model
 
 
 def test_check_result_can_locate_the_failure():
@@ -304,9 +332,18 @@ def test_partial_shipment_anomaly_exists():
 
 # --- misc --------------------------------------------------------------------
 
-def test_schema_version_travels():
+def test_provenance_travels_without_a_schema_version():
+    """meta still has to say WHERE a record came from.
+
+    Dropping the schema version does not mean dropping provenance. model_id,
+    tier, n_sample_index and layout are what cost accounting and agreement
+    scoring are computed from, and they describe the RUN, which genuinely
+    varies. The schema did not.
+    """
     rec = ExtractedRecord(doc=make_fixture_doc(), meta=ExtractionMeta())
-    assert rec.meta.schema_version == SCHEMA_VERSION == "1.2"
+    assert set(ExtractionMeta.model_fields) >= {
+        "model_id", "tier", "n_sample_index", "layout"}
+    assert rec.model_validate_json(rec.model_dump_json()).doc.doc_id == rec.doc.doc_id
 
 
 def test_scoring_modes_are_declarable():

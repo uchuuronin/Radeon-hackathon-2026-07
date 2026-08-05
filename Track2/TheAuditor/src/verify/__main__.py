@@ -13,15 +13,33 @@ This is the end-of-Day-2 deliverable from the plan:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import config
 from schemas import CheckOutcome, ExtractedRecord
 from ladder import Phase, Rung, Scope, Trace, rung, span, summarise
 
-from .engine import verify_doc
+from .engine import verify_doc, verify_pair
+
+
+def _load_one(text: str) -> tuple[ExtractedRecord, Optional[str]]:
+    """Parse a fixture file into (record, counterpart_path).
+
+    Two shapes live in data/fixtures/. A plain ExtractedRecord, and a PAIR
+    wrapper {_comment, counterpart, record} for the checks that need two
+    documents. The CLI used to assume the first shape and died with a raw
+    pydantic traceback on the party-name pair fixture, which is the file the
+    README tells a judge to run. Discriminating on the key is four lines and
+    turns a stack trace into the check firing as intended.
+    """
+    obj = json.loads(text)
+    if "record" in obj:
+        return ExtractedRecord.model_validate(obj["record"]), obj.get("counterpart")
+    return ExtractedRecord.model_validate(obj), None
 
 
 def _iter_records(paths: list[str]):
@@ -41,9 +59,10 @@ def _iter_records(paths: list[str]):
             if p.suffix == ".jsonl":
                 for line in text.splitlines():
                     if line.strip():
-                        yield p, ExtractedRecord.model_validate_json(line)
+                        yield p, ExtractedRecord.model_validate_json(line), None
             else:
-                yield p, ExtractedRecord.model_validate_json(text)
+                rec, counterpart = _load_one(text)
+                yield p, rec, counterpart
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     outcomes: Counter[str] = Counter()
     failed_docs = 0
 
-    for path, rec in _iter_records(args.paths):
+    for path, rec, counterpart in _iter_records(args.paths):
         # This CLI verifies documents in isolation, so each document is its
         # own single-document case. The real pipeline groups by chain; the
         # hierarchy is identical either way, which is the point of it.
@@ -84,6 +103,22 @@ def main(argv: list[str] | None = None) -> int:
                     ev.note = "strict pass" if report.strict_pass else (
                         "escalates: within tolerance"
                         if report.verify_pass else "escalates: failed check")
+        # A pair fixture names its counterpart; run the pair-level checks
+        # too, otherwise party_names_match and chain date order can never
+        # fire from the CLI and two of the seven checks are untestable by
+        # the command the README publishes.
+        if counterpart:
+            cp = Path(counterpart)
+            if not cp.exists():
+                cp = path.parent.parent / Path(counterpart).relative_to(
+                    *Path(counterpart).parts[:2]) if len(
+                    Path(counterpart).parts) > 2 else cp
+            if cp.exists():
+                other, _ = _load_one(cp.read_text(encoding="utf-8").strip())
+                pair_checks = verify_pair(other.doc, rec.doc)
+                report = report.model_copy(update={
+                    "checks": report.checks + pair_checks})
+
         reports.append(report)
         n_docs += 1
         for c in report.checks:
@@ -123,12 +158,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(summarise(trace.summaries()).render())
+    evaluated = sum(r.field_coverage[0] for r in reports)
+    evaluable = sum(r.field_coverage[1] for r in reports)
     print(f"\n{n_docs} documents · "
           f"pass {outcomes[CheckOutcome.PASS]} · "
           f"within-tolerance {outcomes[CheckOutcome.WITHIN_TOLERANCE]} · "
           f"fail {outcomes[CheckOutcome.FAIL]} · "
-          f"skipped {outcomes[CheckOutcome.SKIPPED]} checks · "
+          f"n/a {outcomes[CheckOutcome.SKIPPED]} · "
+          f"inputs-missing {outcomes[CheckOutcome.INPUTS_MISSING]} checks · "
           f"{failed_docs} document(s) failed")
+    print(f"check coverage: {evaluated}/{evaluable} evaluable checks actually "
+          f"ran ({100 * evaluated / evaluable if evaluable else 100:.1f}%)"
+          + ("   <-- fields are missing; a clean pass here is cheap"
+             if evaluated < evaluable else ""))
     return 1 if failed_docs else 0
 
 

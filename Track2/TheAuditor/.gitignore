@@ -72,3 +72,8 @@ desktop.ini
 .ipynb_checkpoints/
 # Notebooks: commit them cleared. Committed outputs make diffs unreviewable
 # and can leak absolute paths from the Radeon instance.
+
+# Conformance artefacts: fetched, never committed (EUPL v1.2, ~20MB).
+# infra/fetch_cen_artefacts.sh
+vendor/
+runs/

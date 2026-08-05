@@ -33,8 +33,7 @@
   "meta": {
     "model_id": "hand-written",
     "tier": "none",
-    "prompt_version": "",
-    "schema_version": "1.2",
+    "prompt_id": "",
     "extraction_ts": null,
     "n_sample_index": null,
     "layout": null

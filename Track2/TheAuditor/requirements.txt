@@ -8,3 +8,9 @@ ruff>=0.4
 # a LOCAL vLLM endpoint — the library is local and no remote endpoint is ever
 # configured. Named here because the README dependency audit must explain it.
 # openai>=1.0
+
+# Conformance harness only (bench/conformance.py). A local XSLT 2.0 processor
+# used to run the CEN reference Schematron over our own generated invoices.
+# DEV DEPENDENCY: nothing in src/ imports it, it makes no network call, and the
+# agent pipeline does not depend on it. The locality claim is unaffected.
+saxonche>=12.4

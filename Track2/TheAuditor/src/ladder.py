@@ -164,13 +164,43 @@ class Trace(_Base):
     def by_id(self) -> dict[str, Span]:
         return {s.span_id: s for s in self.spans}
 
-    def children(self, span_id: str) -> list[Span]:
-        return [s for s in self.spans if s.parent_id == span_id]
+    def _adjacency(self) -> dict[Optional[str], list[Span]]:
+        """parent_id -> children, built in ONE pass.
 
-    def descendants(self, span_id: str) -> list[Span]:
-        out, frontier = [], [span_id]
+        This is the whole shape of the fix. `children()` used to scan every
+        span in the trace, `descendants()` called it once per frontier node,
+        and `summaries()` called THAT once per case, so producing a run
+        report was O(cases x spans) - quadratic in the corpus. At 20 chains
+        it is invisible; the honest benchmark corpus is 300 chains and about
+        13k spans, where quadratic is roughly 40 million comparisons for a
+        report that should be instant, and the S2 sweeps re-run it per
+        configuration. Bucketing children by parent once is the standard
+        parent-array-to-tree construction and makes the whole traversal
+        linear: O(spans) to build, O(subtree) to walk.
+
+        Not cached: a Trace is appended to while a run is in progress and a
+        stale adjacency map would silently drop spans from the totals, which
+        is precisely the class of bug validate_coherence exists to catch.
+        Callers that aggregate repeatedly should build it once and pass it
+        down, which is what summaries() does.
+        """
+        adj: dict[Optional[str], list[Span]] = {}
+        for s in self.spans:
+            adj.setdefault(s.parent_id, []).append(s)
+        return adj
+
+    def children(self, span_id: str) -> list[Span]:
+        return self._adjacency().get(span_id, [])
+
+    def descendants(
+        self, span_id: str,
+        adj: Optional[dict[Optional[str], list[Span]]] = None,
+    ) -> list[Span]:
+        adj = adj if adj is not None else self._adjacency()
+        out: list[Span] = []
+        frontier = [span_id]
         while frontier:
-            for c in self.children(frontier.pop()):
+            for c in adj.get(frontier.pop(), ()):
                 out.append(c)
                 frontier.append(c.span_id)
         return out
@@ -180,8 +210,11 @@ class Trace(_Base):
 
     # --- aggregation --------------------------------------------------------
 
-    def case_summary(self, case_span: Span) -> CaseSummary:
-        kin = self.descendants(case_span.span_id)
+    def case_summary(
+        self, case_span: Span,
+        adj: Optional[dict[Optional[str], list[Span]]] = None,
+    ) -> CaseSummary:
+        kin = self.descendants(case_span.span_id, adj)
         docs = [s for s in kin if s.scope == Scope.DOCUMENT]
         rungs = [s for s in kin if s.scope == Scope.RUNG]
 
@@ -204,7 +237,8 @@ class Trace(_Base):
         )
 
     def summaries(self) -> list[CaseSummary]:
-        return [self.case_summary(c) for c in self.cases()]
+        adj = self._adjacency()          # built once, walked per case
+        return [self.case_summary(c, adj) for c in self.cases()]
 
     # --- self-defence -------------------------------------------------------
 
@@ -216,6 +250,7 @@ class Trace(_Base):
         """
         problems: list[str] = []
         ids = self.by_id()
+        adj = self._adjacency()
 
         for s in self.spans:
             if s.parent_id and s.parent_id not in ids:
@@ -235,7 +270,7 @@ class Trace(_Base):
                                 f"resolve a case")
 
         for case in self.cases():
-            kin = self.descendants(case.span_id)
+            kin = self.descendants(case.span_id, adj)
             resolvers = [s for s in kin if s.resolved_case]
             if len(resolvers) > 1:
                 problems.append(

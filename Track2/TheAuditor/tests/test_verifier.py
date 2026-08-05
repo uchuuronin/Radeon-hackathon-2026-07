@@ -258,7 +258,7 @@ def _doc(**kw) -> CanonicalDoc:
 def test_aggregate_rounding_lands_within_tolerance_not_fail():
     """Three cent-precision lines of 33.33 sum to 99.99; the document states
     a whole-unit subtotal of 100. Delta 0.01, band inferred from the stated
-    precisions ≈ 0.57 — WITHIN_TOLERANCE. The fixed-floor v1.1 verifier
+    precisions ≈ 0.57 — WITHIN_TOLERANCE. A fixed-floor verifier
     would have flagged this legitimate rounding on every such document."""
     lines = [LineItem(line_id=f"LI-{i}", description="unit",
                       quantity=Decimal(1), unit_price=Decimal("33.33"),
@@ -335,3 +335,141 @@ def test_pair_corrupted_fixture_fires_party_names_match():
     grn = ExtractedRecord.model_validate(pair["record"])
     r = {c.check: c for c in verify_pair(po.doc, grn.doc)}
     assert r[CheckName.PARTY_NAMES_MATCH].outcome == CheckOutcome.FAIL
+
+
+# ---------------------------------------------------------------------------
+# Checks and distinctions added after the Stage 0 literature review
+# ---------------------------------------------------------------------------
+
+def _doc(**kw) -> CanonicalDoc:
+    base = dict(
+        doc_id="T-1", doc_number="INV-9001", doc_type=DocType.INVOICE,
+        party_name="Northwind Traders", doc_date=date(2026, 5, 2),
+        currency="USD", source_text="", line_items=[],
+    )
+    base.update(kw)
+    return CanonicalDoc(**base)
+
+
+class TestDerivableValues:
+    """The counting check must not punish a correctly COMPUTED figure, and
+    must still catch the consistent hallucination. Those pull in opposite
+    directions, so both sides are asserted together."""
+
+    def test_unprinted_subtotal_is_warranted_by_printed_operands(self):
+        """A Stripe-style invoice prints lines and one total, no subtotal
+        line. The extractor is right to emit the subtotal and must not be
+        failed for it."""
+        src = ("Consulting 2 @ 500.00 = 1000.00\n"
+               "Widgets    1 @ 250.00 =  250.00\n"
+               "Amount due 1250.00\n")
+        doc = _doc(source_text=src, subtotal=Decimal("1250.00"),
+                   total_excl_tax=Decimal("1250.00"),
+                   total=Decimal("1250.00"),
+                   line_items=[
+                       LineItem(line_id="LI-001", description="Consulting",
+                                quantity=Decimal(2),
+                                unit_price=Decimal("500.00"),
+                                line_total=Decimal("1000.00")),
+                       LineItem(line_id="LI-002", description="Widgets",
+                                quantity=Decimal(1),
+                                unit_price=Decimal("250.00"),
+                                line_total=Decimal("250.00"))])
+        r = next(c for c in verify_doc(doc).checks
+                 if c.check == CheckName.AMOUNTS_APPEAR_IN_SOURCE)
+        assert r.outcome == CheckOutcome.PASS, r.message
+
+    def test_consistent_hallucination_still_fails(self):
+        """Every amount shifted in lockstep. All identities hold. Nothing is
+        grounded, so nothing is derivable, so it must still fail — this is
+        the case the exemption was most at risk of destroying."""
+        src = ("Consulting 2 @ 500.00 = 1000.00\n"
+               "Amount due 1000.00\n")
+        doc = _doc(source_text=src, subtotal=Decimal("1100.00"),
+                   total_excl_tax=Decimal("1100.00"),
+                   total=Decimal("1100.00"),
+                   line_items=[
+                       LineItem(line_id="LI-001", description="Consulting",
+                                quantity=Decimal(2),
+                                unit_price=Decimal("550.00"),
+                                line_total=Decimal("1100.00"))])
+        r = next(c for c in verify_doc(doc).checks
+                 if c.check == CheckName.AMOUNTS_APPEAR_IN_SOURCE)
+        assert r.outcome == CheckOutcome.FAIL
+
+    def test_identifier_digits_do_not_launder_a_hallucination(self):
+        """'PO-4021' puts 4021 on the page. It must not be allowed to stand
+        as evidence for a total of 4021.00 that was never printed."""
+        doc = _doc(doc_number="INV-9001", references=["PO-4021"],
+                   source_text="INVOICE INV-9001 against PO-4021\n",
+                   total=Decimal("4021.00"))
+        r = next(c for c in verify_doc(doc).checks
+                 if c.check == CheckName.AMOUNTS_APPEAR_IN_SOURCE)
+        assert r.outcome == CheckOutcome.FAIL
+
+
+class TestBrDecMaxTwoDecimals:
+    def test_three_decimals_fail(self):
+        """A third decimal in a money field is textually impossible and is a
+        tell that the figure was computed rather than read."""
+        doc = _doc(source_text="Total 33.333\n", total=Decimal("33.333"))
+        r = next(c for c in verify_doc(doc).checks
+                 if c.check == CheckName.BR_DEC_MAX_2)
+        assert r.outcome == CheckOutcome.FAIL and "BR-DEC-14" in r.message
+
+    def test_two_decimals_and_whole_units_pass(self):
+        for v in ("100", "100.0", "100.00"):
+            doc = _doc(source_text=f"Total {v}\n", total=Decimal(v))
+            r = next(c for c in verify_doc(doc).checks
+                     if c.check == CheckName.BR_DEC_MAX_2)
+            assert r.outcome == CheckOutcome.PASS, v
+
+    def test_unit_price_is_not_constrained(self):
+        """EN 16931 caps AMOUNTS at two decimals, not unit prices; real
+        catalogues quote four. Checking it would manufacture failures."""
+        doc = _doc(source_text="1000 @ 0.0125 = 12.50\n",
+                   line_items=[LineItem(
+                       line_id="LI-001", description="Fastener",
+                       quantity=Decimal(1000), unit_price=Decimal("0.0125"),
+                       line_total=Decimal("12.50"))])
+        r = next(c for c in verify_doc(doc).checks
+                 if c.check == CheckName.BR_DEC_MAX_2)
+        assert r.outcome == CheckOutcome.PASS
+
+    def test_whole_generated_corpus_is_clean(self):
+        for i in range(6):
+            for layout in (Layout.A, Layout.B):
+                for doc in materialise(generate_chain(i, 1337), layout):
+                    r = next(c for c in verify_doc(doc).checks
+                             if c.check == CheckName.BR_DEC_MAX_2)
+                    assert r.outcome == CheckOutcome.PASS, doc.doc_id
+
+
+class TestCoverageIsNotFreeToGame:
+    """An extractor that emits fewer fields must not thereby buy a cheaper
+    verification. Pass/fail is unchanged; coverage is what moves."""
+
+    def test_missing_field_is_neutral_but_costs_coverage(self):
+        doc = _doc(source_text="Net 100.00\n",
+                   total_excl_tax=Decimal("100.00"))   # total not extracted
+        rep = verify_doc(doc)
+        r = next(c for c in rep.checks if c.check == CheckName.BR_CO_15)
+        assert r.outcome == CheckOutcome.INPUTS_MISSING
+        assert rep.verify_pass                      # still not a failure
+        done, total = rep.field_coverage
+        assert done < total                         # but it is visible
+
+    def test_not_applicable_does_not_cost_coverage(self):
+        """A payment has no lines. BR-CO-10 cannot mean anything and its
+        absence is not a gap in the evidence."""
+        doc = _doc(doc_type=DocType.PAYMENT, source_text="Paid 500.00\n",
+                   total=Decimal("500.00"))
+        rep = verify_doc(doc)
+        r = next(c for c in rep.checks if c.check == CheckName.BR_CO_10)
+        assert r.outcome == CheckOutcome.SKIPPED
+        assert rep.evaluable_pct == 100.0
+
+    def test_strict_pass_ignores_both_neutral_states(self):
+        doc = _doc(source_text="Net 100.00\n",
+                   total_excl_tax=Decimal("100.00"))
+        assert verify_doc(doc).strict_pass

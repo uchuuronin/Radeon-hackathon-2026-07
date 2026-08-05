@@ -37,7 +37,6 @@ from decimal import Decimal as D
 from pathlib import Path
 
 from schemas import (
-    SCHEMA_VERSION,
     CanonicalDoc,
     DocType,
     ExtractedRecord,
@@ -396,8 +395,7 @@ def main() -> None:
     for name, doc in FIXTURES:
         rec = ExtractedRecord(
             doc=doc,
-            meta=ExtractionMeta(tier=Tier.NONE, model_id="hand-written",
-                                schema_version=SCHEMA_VERSION))
+            meta=ExtractionMeta(tier=Tier.NONE, model_id="hand-written"))
         (OUT / f"{name}.json").write_text(rec.model_dump_json(indent=2),
                                           encoding="utf-8")
     print(f"{len(FIXTURES)} fixtures -> {OUT}")

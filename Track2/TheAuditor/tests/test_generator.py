@@ -65,7 +65,7 @@ def test_line_net_amount_identity(doc):
 # --- document semantics ------------------------------------------------------
 
 def test_goods_receipt_has_quantities_but_no_money():
-    """The case that forced LineItem prices Optional in v1.2. A GRN records
+    """The case that forces LineItem prices to be Optional. A GRN records
     what arrived, not what it cost."""
     grns = [d for d in ALL_DOCS if d.doc_type == DocType.GOODS_RECEIPT]
     assert grns

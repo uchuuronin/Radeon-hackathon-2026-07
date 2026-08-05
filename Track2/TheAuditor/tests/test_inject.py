@@ -36,10 +36,55 @@ ALL = [chain(i) for i in range(20)]
 
 
 def test_stratification_covers_every_type_deterministically():
-    slots = [slot_for(i) for i in range(20)]
-    assert slots.count("clean") == 6
+    """One full cycle of the slot table gives one of everything, whatever the
+    seed. Coverage is a property of the table, not of luck."""
+    n = len(SLOTS)
+    slots = [slot_for(i) for i in range(n)]
+    assert slots.count("clean") == SLOTS.count("clean")
     for s in set(SLOTS) - {"clean"}:
-        assert slots.count(s) == 2, s
+        assert slots.count(s) == 1, s
+    # Three cycles, three of each: the canonical corpus is a whole number of
+    # cycles so per-type counts never depend on where the corpus was cut.
+    triple = [slot_for(i) for i in range(3 * n)]
+    for s in set(SLOTS):
+        assert triple.count(s) == 3 * SLOTS.count(s), s
+
+
+def test_holdout_slots_are_frozen():
+    """Chains 0-4 are rendered into the sealed holdout. Reordering the head of
+    the slot table would change what those committed files contain and there
+    is no way to notice from inside the holdout, so the guard lives here."""
+    assert SLOTS[:10] == (
+        "clean", "clean", "clean", "price_drift_decoy",
+        "price_drift", "quantity_mismatch", "near_duplicate",
+        "unapplied_discount", "term_change", "partial_shipment")
+
+
+def test_decoys_straddle_the_tolerance_boundary():
+    """The corpus must contain cases on BOTH sides of the band and close to
+    it. Without these every threshold between the easy negatives and the
+    gross positives scores identically and the risk-coverage curve measures
+    nothing."""
+    from inject import BAND_FRACTIONS
+    inside = [f for f in BAND_FRACTIONS.values() if f < 1]
+    outside = [f for f in BAND_FRACTIONS.values() if f > 1]
+    assert inside and outside
+    # The decisive pair: nearest negative and nearest positive within a tenth
+    # of the band of each other, demanding opposite verdicts.
+    assert min(outside) - max(inside) <= 0.15
+
+
+@pytest.mark.parametrize("slot,fraction", sorted(
+    __import__("inject").BAND_FRACTIONS.items()))
+def test_band_targeted_drift_lands_on_the_intended_side(slot, fraction):
+    """Labels come from the ACHIEVED delta, so the corpus cannot contain an
+    answer key that disagrees with its own documents. Cent quantisation moves
+    the realised value; this asserts it never moves it across the band."""
+    idx = SLOTS.index(slot)
+    _, docs, anomalies = chain(idx)
+    a = anomalies[0]
+    assert a.is_within_tolerance == (fraction < 1), (
+        f"{slot} aimed {fraction} but landed the other side: {a.note}")
 
 
 def test_injection_is_deterministic():

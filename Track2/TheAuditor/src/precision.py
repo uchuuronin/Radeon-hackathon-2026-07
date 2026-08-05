@@ -17,11 +17,22 @@ byte-preserved: we can see the rendered form of every amount.
 
 WHERE WE DIVERGE, AND WHY
 -------------------------
-For a SUM of N independently-rounded amounts, the worst-case accumulated
-error is the sum of the half-ULPs of the operands, not the max. Summing ten
-values each rounded to the cent can legitimately drift 5 cents from an exact
-computation. So `inferred_tolerance` sums half-ULPs across all operands
-rather than taking a single one. This is arithmetic, not a citation.
+For a SUM of N independently-rounded amounts, Beancount's single-operand
+inference is not enough: the accumulated error depends on all N operands.
+There are two defensible bounds and we implement BOTH, because they answer
+different questions and quoting only one is a misrepresentation:
+
+  LINEAR  sum of half-ULPs.  The WORST CASE, every rounding error aligned in
+          sign. The standard interval-arithmetic forward bound. Grows O(N).
+  RSS     sqrt(sum of squared half-ULPs). The PROBABILISTIC bound when the
+          rounding errors are independent, zero-mean and roughly uniform,
+          which is the realistic model for independently-rounded document
+          amounts. Grows O(sqrt(N)) and is therefore TIGHTER.
+
+Default is RSS. Linear is a ceiling that, at N=4 operands, is twice as wide
+and would silently absorb a real one-cent-per-line error across four lines.
+Set mode="linear" where a conservative bound is wanted and say so in the
+spec; do not report a number without naming the mode that produced it.
 
 SCOPE CUT (v1, stated deliberately)
 -----------------------------------
@@ -34,7 +45,8 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
-from typing import Iterable
+from functools import lru_cache
+from typing import Iterable, Literal, Optional
 
 # Default buffer on inferred tolerances. Beancount exposes the same idea as
 # `inferred_tolerance_multiplier`; 1.1 is its documented recommendation.
@@ -94,17 +106,43 @@ def half_ulp(rendered: str) -> Decimal:
     return ulp(rendered) / 2
 
 
+#: Accumulation model for multi-operand tolerance. See the header.
+ToleranceMode = Literal["rss", "linear"]
+DEFAULT_TOLERANCE_MODE: ToleranceMode = "rss"
+
+
+def _isqrt_decimal(x: Decimal) -> Decimal:
+    """Square root of a Decimal without importing math (which would force a
+    float round-trip and reintroduce exactly the binary-float imprecision the
+    whole project bans). decimal.Decimal.sqrt is correctly rounded under the
+    active context, which is what we want."""
+    return x.sqrt()
+
+
 def inferred_tolerance(
     rendered: Iterable[str],
     multiplier: Decimal = DEFAULT_INFERRED_MULTIPLIER,
+    mode: ToleranceMode = DEFAULT_TOLERANCE_MODE,
 ) -> Decimal:
     """Tolerance for an identity over the given rendered operands.
 
-    Sum of half-ULPs, scaled by the buffer multiplier. Returns 0 for an empty
-    operand list — callers fall back to their configured absolute floor.
+    mode="rss"    sqrt(sum of squared half-ULPs) — the independent-error
+                  bound. Default. Tighter, and the honest model for amounts
+                  rounded independently by different systems.
+    mode="linear" sum of half-ULPs — the worst-case aligned-error ceiling.
+
+    Returns 0 for an empty operand list; callers fall back to their configured
+    absolute floor. One operand gives the same answer under both modes, so
+    single-amount call sites are unaffected by the default change.
     """
-    total = sum((half_ulp(r) for r in rendered), Decimal(0))
-    return total * multiplier
+    halves = [half_ulp(r) for r in rendered]
+    if not halves:
+        return Decimal(0)
+    if mode == "linear":
+        acc = sum(halves, Decimal(0))
+    else:
+        acc = _isqrt_decimal(sum((h * h for h in halves), Decimal(0)))
+    return acc * multiplier
 
 
 def find_amounts(text: str) -> set[Decimal]:
@@ -116,18 +154,16 @@ def find_amounts(text: str) -> set[Decimal]:
     in both cases and the check must not punish it. Comparing VALUES rather
     than STRINGS keeps the check meaningful without making it layout-specific.
     """
-    out: set[Decimal] = set()
-    for token in _AMOUNT_TOKEN.findall(text):
-        try:
-            out.add(parse_amount(token))
-        except AmbiguousAmountError:
-            continue
-    return out
+    return {v for v, _ in _multiset_cached(text)}
 
 
 def count_occurrences(value: Decimal, text: str) -> int:
-    """How many numeric tokens in `text` equal `value`."""
-    return sum(1 for v in find_amounts(text) if v == value)
+    """How many numeric tokens in `text` equal `value`.
+
+    Was a full rescan per value, so checking V amounts on one document cost
+    O(V x T). The shared cached multiset makes it one scan plus V dict hits.
+    """
+    return dict(_multiset_cached(text)).get(value, 0)
 
 
 def amount_in_source(value: Decimal, source_text: str) -> bool:
@@ -145,6 +181,7 @@ def unexplained_claims(
     claimed: Iterable[tuple[str, Decimal]],
     non_monetary: Iterable[Decimal],
     text: str,
+    exempt: Optional[Iterable[Decimal]] = None,
 ) -> list[tuple[str, Decimal]]:
     """Monetary claims with no independent evidence in the source.
 
@@ -169,6 +206,16 @@ def unexplained_claims(
     Claims are de-duplicated BY VALUE, not by field: a Coupa-style purchase
     order where subtotal, net and total are all 11100 prints that figure once
     and is perfectly correct.
+
+    `exempt` is the DERIVABLE set: values the document never printed but which
+    follow arithmetically from values it DID print. This closes the check's
+    worst false-reject. A layout that prints line items and a grand total but
+    no subtotal line is completely ordinary, and the extractor is RIGHT to
+    emit the subtotal; failing it for "hallucinating" a number it correctly
+    computed would punish exactly the behaviour we want. Membership counting
+    can only ever ground VERBATIM values, so derived values need a different
+    warrant, and arithmetic derivability from grounded operands is that
+    warrant. The caller computes the set because only it knows the identities.
     """
     present = find_amounts_multiset(text)
     explained: dict[Decimal, int] = {}
@@ -179,18 +226,28 @@ def unexplained_claims(
     for path, value in claimed:
         distinct.setdefault(value, path)
 
+    exempt_set = set(exempt or ())
+
     missing: list[tuple[str, Decimal]] = []
     for value, path in distinct.items():
+        if value in exempt_set:
+            continue
         if present.get(value, 0) <= explained.get(value, 0):
             missing.append((path, value))
     return missing
 
 
-def find_amounts_multiset(text: str) -> dict[Decimal, int]:
-    """Every numeric value in `text` with its occurrence COUNT.
+@lru_cache(maxsize=512)
+def _multiset_cached(text: str) -> tuple[tuple[Decimal, int], ...]:
+    """Tokenise once per distinct source_text.
 
-    find_amounts() collapses duplicates into a set, which loses exactly the
-    information the counting argument needs.
+    WHY THIS IS CACHED: Mechanism B samples the SAME document N times for
+    self-consistency, and every sample re-runs the verifier against a
+    byte-identical source_text. Without a cache the tokenising regex runs
+    N times over the same kilobyte for zero new information; the run is
+    O(N x T) where it should be O(T). Documents are ~1 KB, so 512 entries is
+    well under a megabyte. Returns a tuple because lru_cache requires a
+    hashable return the caller cannot mutate.
     """
     out: dict[Decimal, int] = {}
     for token in _AMOUNT_TOKEN.findall(text):
@@ -199,4 +256,13 @@ def find_amounts_multiset(text: str) -> dict[Decimal, int]:
         except AmbiguousAmountError:
             continue
         out[v] = out.get(v, 0) + 1
-    return out
+    return tuple(out.items())
+
+
+def find_amounts_multiset(text: str) -> dict[Decimal, int]:
+    """Every numeric value in `text` with its occurrence COUNT.
+
+    find_amounts() collapses duplicates into a set, which loses exactly the
+    information the counting argument needs.
+    """
+    return dict(_multiset_cached(text))

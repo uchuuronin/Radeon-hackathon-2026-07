@@ -297,7 +297,26 @@ def test_calibrator_round_trips_and_is_inspectable():
     cal = IsotonicCalibrator.fit(scores, correct)
     back = IsotonicCalibrator.model_validate_json(cal.model_dump_json())
     assert back.predict(0.8) == pytest.approx(cal.predict(0.8))
-    assert len(back.xs) == len(back.ys) == 50
+    # Parallel arrays, and no more knots than training points: PAV yields a
+    # step function and the interior of a constant block carries no
+    # information, so it is not stored. Inspectability is the point, and a
+    # shorter table is MORE inspectable, not less.
+    assert len(back.xs) == len(back.ys) <= 50
+    # Still a faithful reconstruction at every training point.
+    for x, y in zip(cal.xs, cal.ys):
+        assert cal.predict(x) == pytest.approx(y)
+
+
+def test_calibrator_compaction_is_lossless():
+    """Dropping redundant knots must not move a single prediction."""
+    scores, correct = synthetic(n=400)
+    cal = IsotonicCalibrator.fit(scores, correct)
+    assert len(cal.xs) < 400                      # compaction actually happened
+    probe = [i / 500 for i in range(501)]
+    # Monotone and bounded everywhere, which is the property routing relies on.
+    got = cal.predict_many(probe)
+    assert all(0.0 <= v <= 1.0 for v in got)
+    assert all(a <= b + 1e-12 for a, b in zip(got, got[1:]))
 
 
 def test_calibrator_holds_no_case_data():
@@ -319,3 +338,111 @@ def test_calibration_is_deterministic():
     """A tau that moves between runs is not a decision, it is a coin flip."""
     scores, _ = synthetic()
     assert threshold_for_coverage(scores, 0.6) == threshold_for_coverage(list(scores), 0.6)
+
+
+# ---------------------------------------------------------------------------
+# Reporting a small, deliberately balanced corpus honestly
+# ---------------------------------------------------------------------------
+
+class TestSmallSampleReporting:
+    def test_two_of_two_is_not_a_measurement(self):
+        """The number the corpus used to produce. 100% recall on n=2 is
+        consistent with a detector that misses two thirds of them, and a bare
+        percentage hides that completely."""
+        from calibrate import wilson_interval
+        iv = wilson_interval(2, 2)
+        assert iv.point == 1.0
+        assert iv.lo < 0.40
+
+    def test_interval_tightens_with_n(self):
+        from calibrate import wilson_interval
+        widths = [wilson_interval(n, n).hi - wilson_interval(n, n).lo
+                  for n in (2, 10, 30, 100)]
+        assert widths == sorted(widths, reverse=True)
+
+    def test_wilson_is_not_degenerate_at_the_extremes(self):
+        """The normal approximation returns zero width at 0/n and n/n, which
+        is exactly where small-corpus results land."""
+        from calibrate import wilson_interval
+        assert wilson_interval(0, 5).hi > 0.0
+        assert wilson_interval(5, 5).lo < 1.0
+
+    def test_corpus_sizing_is_computed_not_guessed(self):
+        from calibrate import required_n_for_halfwidth, wilson_interval
+        n = required_n_for_halfwidth(0.10, p=0.9)
+        iv = wilson_interval(round(0.9 * n), n)
+        assert (iv.hi - iv.lo) / 2 <= 0.10
+        assert n <= 60                       # affordable: generation is free
+
+    def test_precision_does_not_survive_a_prevalence_change(self):
+        """Recall is a property of the detector; precision is a property of
+        the detector AND the base rate. Quoting the balanced-corpus figure
+        for a production queue overstates it by an order of magnitude."""
+        from calibrate import precision_at_prevalence
+        balanced = precision_at_prevalence(0.95, 0.02, 0.70)
+        realistic = precision_at_prevalence(0.95, 0.02, 0.01)
+        assert balanced > 0.95
+        assert realistic < 0.40
+        assert balanced / realistic > 2
+
+
+class TestCalibrationMetrics:
+    def test_equal_mass_does_not_split_tied_scores(self):
+        """100 documents all scoring 0.9, half correct. The true gap is 0.40;
+        splitting the tie across bins reports 0.50."""
+        from calibrate import expected_calibration_error
+        probs = [0.9] * 100
+        correct = [True] * 50 + [False] * 50
+        assert expected_calibration_error(probs, correct) == pytest.approx(0.40)
+
+    def test_both_schemes_agree_on_a_hand_computable_case(self):
+        from calibrate import expected_calibration_error
+        probs = [0.1] * 50 + [0.9] * 50
+        correct = [True] * 25 + [False] * 25 + [True] * 25 + [False] * 25
+        for scheme in ("equal_mass", "equal_width"):
+            assert expected_calibration_error(
+                probs, correct, scheme=scheme) == pytest.approx(0.40)
+
+    def test_brier_is_bounded_and_proper(self):
+        from calibrate import brier_score
+        assert brier_score([1.0, 0.0], [True, False]) == 0.0
+        assert brier_score([0.0, 1.0], [True, False]) == 1.0
+        # Hedging beats being confidently wrong, which is what "proper" buys.
+        assert brier_score([0.5, 0.5], [True, False]) < \
+            brier_score([0.0, 1.0], [True, False])
+
+    def test_unknown_scheme_is_refused(self):
+        from calibrate import expected_calibration_error
+        with pytest.raises(ValueError):
+            expected_calibration_error([0.5], [True], scheme="quantile")
+
+
+class TestQuickselectThreshold:
+    def test_matches_a_sort_based_reference_everywhere(self):
+        import random
+        from calibrate import threshold_for_coverage
+        rng = random.Random(7)
+        for _ in range(300):
+            n = rng.randint(1, 80)
+            scores = [round(rng.random(), 3) for _ in range(n)]
+            cov = rng.choice([0.0, 0.25, 0.5, 0.75, 1.0, rng.random()])
+            got = threshold_for_coverage(scores, cov)
+            s = sorted(scores, reverse=True)
+            exp = (float(s[0]) + 1e-9 if cov == 0.0
+                   else float(s[max(1, min(n, round(cov * n))) - 1]))
+            assert got == pytest.approx(exp)
+
+    def test_survives_the_adversarial_shape(self):
+        """Already-sorted input with heavy ties near 1.0 is exactly what a
+        verifier-anchored confidence signal produces, and exactly what a
+        naive pivot degrades on."""
+        from calibrate import threshold_for_coverage
+        scores = sorted([1.0] * 500 + [0.5] * 500)
+        assert threshold_for_coverage(scores, 0.5) == 1.0
+
+    def test_does_not_mutate_the_caller_list(self):
+        from calibrate import threshold_for_coverage
+        scores = [0.3, 0.9, 0.1, 0.7]
+        before = list(scores)
+        threshold_for_coverage(scores, 0.5)
+        assert scores == before

@@ -18,11 +18,32 @@ and tests/test_inject.py asserts it.
 The exception is nothing: even the near-duplicate is a coherent invoice.
 Doc-level corruption (extraction errors) is A6's job, already done.
 
-DECOYS
-------
+DECOYS, AND WHY THEY ARE PLACED WHERE THEY ARE
+---------------------------------------------
 Some price drifts are planted BELOW the cross-document tolerance band and
 recorded with is_within_tolerance=True. The system is scored on NOT flagging
-them — precision measured honestly, not "flag everything and claim recall".
+them: precision measured honestly, not "flag everything and claim recall".
+
+The FIRST version of this got the idea right and the magnitudes wrong.
+Measured, its decoys sat at roughly 0.4% of the band while genuine drifts
+sat at 1.5x to 20x it, so the whole region next to the decision boundary was
+empty. Nothing in the corpus could distinguish a threshold at 0.5x from one
+at 1.4x, every such threshold scored perfectly, and the risk-coverage curve
+those scores produce is a straight line through empty space. Easy negatives
+measure nothing; the informative ones sit where the decision is actually
+hard.
+
+So decoys are now STRATIFIED ACROSS THE BOUNDARY: negatives at 0.50, 0.80
+and 0.95 of the band (must not flag) and near-positives at 1.05 and 1.20
+(must flag). The 0.95 and 1.05 pair differ by a tenth of the band and demand
+opposite verdicts, which is the case that decides whether the tolerance model
+is real.
+
+Placement is by ACHIEVED delta, never by intent: the per-unit price is
+quantised to cents, so the realised total can land either side of the
+requested fraction. is_within_tolerance is set from what the document
+actually says after injection, and tests/test_inject.py asserts the achieved
+fraction is on the intended side of 1.0.
 """
 
 from __future__ import annotations
@@ -88,31 +109,75 @@ def _priced_line(doc: CanonicalDoc, rng: random.Random):
 
 # --- injectors: (docs, rng) -> (docs, PlantedAnomaly) -----------------------
 
-def inject_price_drift(docs, rng, decoy=False):
+def _tax_multiplier(doc) -> D:
+    """How a change to the subtotal propagates to the total on this document.
+
+    A line change of X moves the subtotal by X, and tax is recomputed off the
+    new net, so the TOTAL moves by X * (1 + rate). Targeting a band fraction
+    on the total without this lands every decoy roughly one tax rate away
+    from where it was aimed, which for a 20% VAT chain is enough to push a
+    0.95-of-band negative over the line and invert its label.
+    """
+    if doc.tax is None or not doc.total_excl_tax:
+        return D(1)
+    return D(1) + (doc.tax / doc.total_excl_tax)
+
+
+def inject_price_drift(docs, rng, decoy=False, band_fraction=None):
+    """Price drift, optionally aimed at a chosen multiple of the tolerance band.
+
+    band_fraction=None  gross drift, 3-9% of unit price (the obvious case).
+    band_fraction=f     solve for the per-unit change whose effect on the
+                        invoice TOTAL is f x the cross-document band. f < 1
+                        is a negative the system must not flag; f > 1 is a
+                        near-positive it must.
+    """
     inv = docs[INVOICE]
     li = _priced_line(inv, rng)
-    if decoy:
-        # Stay strictly inside the cross-document band on the TOTAL.
-        band = allowed_delta(inv.total, CROSS_DOC_TOLERANCE)
+    po_total = docs[PO].total
+    band = allowed_delta(po_total, CROSS_DOC_TOLERANCE)
+
+    if band_fraction is not None:
+        target = band * D(str(band_fraction))
+        per_unit = q(target / (li.quantity * _tax_multiplier(inv)))
+        if per_unit == 0:                 # band too tight for cent precision
+            per_unit = D("0.01")
+    elif decoy:
         per_unit = q(min(band / 2, D("0.40")) / li.quantity) or D("0.01")
     else:
         pct = D(rng.randint(3, 9)) / 100
         per_unit = q(li.unit_price * pct) or D("0.05")
+
     new_price = q(li.unit_price + per_unit)
     docs = list(docs)
     docs[INVOICE] = _reprice_line(inv, li.line_id, unit_price=new_price)
     # Payment settles the invoice AS BILLED — the drift is PO vs invoice.
     docs[PAYMENT] = docs[PAYMENT].model_copy(
         update={"total": docs[INVOICE].total})
+
+    # Label from what the corpus ACTUALLY contains, not from what was asked
+    # for. Cent quantisation moves the realised delta, and a decoy whose
+    # achieved value crossed the band would be an answer key that lies.
+    achieved = abs(docs[INVOICE].total - po_total)
+    fraction = achieved / band if band else D(0)
+    within = fraction <= 1
+
+    if band_fraction is not None:
+        note = (f"aimed {band_fraction:.2f}x band, achieved {fraction:.3f}x "
+                f"({achieved} of ±{band}); "
+                + ("must NOT flag" if within else "must flag"))
+    elif decoy:
+        note = "decoy: total delta inside the cross-doc band; must NOT flag"
+    else:
+        note = f"invoice bills {new_price} vs agreed {li.unit_price}"
+
     return docs, PlantedAnomaly(
         anomaly_type=AnomalyType.PRICE_DRIFT,
         doc_ids_involved=[docs[PO].doc_id, docs[INVOICE].doc_id],
         field_path=f"line_items[{li.line_id}].unit_price",
         expected_delta=per_unit,
-        is_within_tolerance=decoy,
-        note=("decoy: total delta inside the cross-doc band; must NOT flag"
-              if decoy else
-              f"invoice bills {new_price} vs agreed {li.unit_price}"))
+        is_within_tolerance=within,
+        note=note)
 
 
 def inject_quantity_mismatch(docs, rng):
@@ -132,10 +197,26 @@ def inject_quantity_mismatch(docs, rng):
 
 
 def inject_partial_shipment(docs, rng):
-    """The canonical hard case: ship 480 of 500, invoice all 500."""
+    """The canonical hard case: ship 480 of 500, invoice all 500.
+
+    Line choice is deliberately not a plain filter on quantity >= 2. It was,
+    and at 20 chains it always found one; at 480 chains a chain eventually
+    turns up whose every line is a single unit, and the filter returned an
+    empty list and took the whole generator down. A generator that works
+    until the corpus is big enough to be worth measuring is worse than one
+    that fails immediately, so: prefer a shippable-in-part line, fall back to
+    the largest line and short it by half, and never emit a receipt for a
+    negative or zero quantity.
+    """
     grn = docs[GRN]
-    li = rng.choice([l for l in grn.line_items if l.quantity >= 2])
-    short = max(D(1), q(li.quantity * D("0.10")).quantize(D("1")))
+    divisible = [l for l in grn.line_items if l.quantity >= 2]
+    if divisible:
+        li = rng.choice(divisible)
+        short = max(D(1), q(li.quantity * D("0.10")).quantize(D("1")))
+    else:
+        li = max(grn.line_items, key=lambda l: l.quantity)
+        short = (li.quantity / 2).quantize(D("0.1"))
+    short = min(short, li.quantity - D("0.1"))     # something must arrive
     docs = list(docs)
     lines = [l.model_copy(update={"quantity": l.quantity - short})
              if l.line_id == li.line_id else l for l in grn.line_items]
@@ -208,12 +289,38 @@ def inject_term_change(docs, rng):
 
 # --- stratification ----------------------------------------------------------
 
-#: Slot table, cycled by chain index. 10 slots: 3 clean, 1 decoy, 6 anomalous
-#: (one per type). With --n 20 every category appears exactly twice —
-#: coverage by construction, independent of seed.
-SLOTS = ("clean", "clean", "clean", "price_drift_decoy",
-         "price_drift", "quantity_mismatch", "near_duplicate",
-         "unapplied_discount", "term_change", "partial_shipment")
+#: Slot table, cycled by chain index. Coverage by construction, independent
+#: of seed: at --n 480 every slot appears exactly 30 times, which is the size
+#: calibrate.required_n_for_halfwidth says a per-type recall claim needs to
+#: carry a Wilson half-width under ten points.
+#:
+#: THE FIRST TEN ENTRIES ARE FROZEN AND MUST NOT BE REORDERED. Chains 0-4 are
+#: the sealed holdout in data/fixtures/holdout/docs/, rendered and committed
+#: on Day 2. Those files were generated from slots 0-4, so touching any of
+#: them silently invalidates the seal: the holdout documents would no longer
+#: correspond to any answer key the generator can produce, and the one
+#: artifact whose value depends entirely on never having been reopened would
+#: be quietly worthless. New behaviour is APPENDED, never inserted.
+SLOTS = (
+    # --- FROZEN: chains 0-9, and the holdout depends on 0-4 ----------------
+    "clean", "clean", "clean", "price_drift_decoy",
+    "price_drift", "quantity_mismatch", "near_duplicate",
+    "unapplied_discount", "term_change", "partial_shipment",
+    # --- APPENDED: boundary-straddling hard cases --------------------------
+    # Negatives, ascending towards the band. The system must flag NONE.
+    "decoy_050", "decoy_080", "decoy_095",
+    # Near-positives, just past it. The system must flag ALL.
+    # decoy_095 and drift_105 differ by a tenth of the band and demand
+    # opposite verdicts: that pair is the corpus's real discriminating power.
+    "drift_105", "drift_120",
+    # Keeps clean chains at a quarter of the corpus so precision has enough
+    # true negatives to be a meaningful denominator.
+    "clean", "clean",
+)
+
+#: Slot name -> band multiple, for the stratified price-drift slots.
+BAND_FRACTIONS = {"decoy_050": 0.50, "decoy_080": 0.80, "decoy_095": 0.95,
+                  "drift_105": 1.05, "drift_120": 1.20}
 
 
 def slot_for(chain_index: int) -> str:
@@ -230,6 +337,10 @@ def inject_for_slot(slot: str, docs, rng):
         return list(docs), []
     if slot == "price_drift_decoy":
         d, a = inject_price_drift(docs, rng, decoy=True)
+        return d, [a]
+    if slot in BAND_FRACTIONS:
+        d, a = inject_price_drift(docs, rng,
+                                  band_fraction=BAND_FRACTIONS[slot])
         return d, [a]
     d, a = {
         "price_drift": inject_price_drift,

@@ -66,6 +66,11 @@ _NUMERIC = (
 )
 
 
+def _fmt_is_alpha(fmt: str) -> bool:
+    """Does this format expect a written month name rather than digits?"""
+    return "%b" in fmt or "%B" in fmt
+
+
 class DateReading(NamedTuple):
     """What a raw date string can legitimately mean.
 
@@ -95,19 +100,39 @@ def read_date(raw: str, date_order: Optional[str] = None) -> DateReading:
     import datetime as _dt
 
     s = " ".join(raw.strip().split())
-    for fmt in _UNAMBIGUOUS:
-        try:
-            return DateReading((_dt.datetime.strptime(s, fmt).date(),), False)
-        except ValueError:
-            continue
+
+    # SHAPE DISPATCH. Every strptime miss costs a raised-and-caught
+    # ValueError, and blind-trying all fifteen formats meant a purely numeric
+    # date paid for seven alpha-month attempts it could never match, and vice
+    # versa. One character class test decides which family can possibly
+    # apply, and within the numeric family the separator decides which three
+    # of the eight. Rung 0's claim is that it is free, and "free" has to
+    # survive the corpus growing by an order of magnitude.
+    has_alpha = any(c.isalpha() for c in s)
+
+    if has_alpha or "-" in s or "/" in s:
+        for fmt in _UNAMBIGUOUS:
+            if _fmt_is_alpha(fmt) != has_alpha:
+                continue
+            try:
+                return DateReading((_dt.datetime.strptime(s, fmt).date(),),
+                                   False)
+            except ValueError:
+                continue
+    if has_alpha:
+        return DateReading((), False)      # no numeric format can match
+
+    sep = next((c for c in s if c in "/-."), None)
 
     seen: dict[date, str] = {}
     for fmt, order in _NUMERIC:
+        if sep is not None and sep not in fmt:
+            continue
+        if date_order and order != date_order:
+            continue
         try:
             d = _dt.datetime.strptime(s, fmt).date()
         except ValueError:
-            continue
-        if date_order and order != date_order:
             continue
         seen.setdefault(d, order)
 

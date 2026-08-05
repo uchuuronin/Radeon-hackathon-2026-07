@@ -39,7 +39,6 @@ from decimal import Decimal
 from pathlib import Path
 
 from schemas import (
-    SCHEMA_VERSION,
     AnswerKey,
     CanonicalDoc,
     ChainKey,
@@ -68,13 +67,13 @@ PARTIES = [
 ]
 
 PRODUCTS = [
-    ("Hydraulic valve assembly", "EA", Decimal("1450.00"), Decimal("2200.00")),
-    ("Stainless bracket, 40mm", "EA", Decimal("12.50"), Decimal("48.00")),
-    ("Industrial coolant", "L", Decimal("8.20"), Decimal("19.75")),
-    ("Bearing housing, cast", "EA", Decimal("310.00"), Decimal("890.00")),
+    ("Hydraulic valve assembly", "H87", Decimal("1450.00"), Decimal("2200.00")),
+    ("Stainless bracket, 40mm", "H87", Decimal("12.50"), Decimal("48.00")),
+    ("Industrial coolant", "LTR", Decimal("8.20"), Decimal("19.75")),
+    ("Bearing housing, cast", "H87", Decimal("310.00"), Decimal("890.00")),
     ("Installation labour", "HUR", Decimal("95.00"), Decimal("180.00")),
-    ("Conveyor belt section", "M", Decimal("64.00"), Decimal("155.00")),
-    ("Control panel, 8-channel", "EA", Decimal("2100.00"), Decimal("3400.00")),
+    ("Conveyor belt section", "MTR", Decimal("64.00"), Decimal("155.00")),
+    ("Control panel, 8-channel", "H87", Decimal("2100.00"), Decimal("3400.00")),
     ("Calibration service", "HUR", Decimal("120.00"), Decimal("240.00")),
 ]
 
@@ -98,7 +97,7 @@ def _lines(rng: random.Random) -> list[LineItem]:
     for i, (desc, uom, lo, hi) in enumerate(
         rng.sample(PRODUCTS, rng.randint(2, 4)), start=1
     ):
-        if uom in ("HUR", "L", "M"):
+        if uom in ("HUR", "LTR", "MTR"):
             qty = Decimal(str(rng.choice([1, 1.5, 2, 2.5, 3, 4, 7.5, 12])))
         else:
             qty = Decimal(rng.randint(1, 40))
@@ -176,7 +175,7 @@ def generate_chain(chain_index: int, seed: int,
     )
 
     # A goods receipt records WHAT ARRIVED, not what it cost. Quantities only,
-    # prices absent — the reason LineItem prices became Optional in v1.2.
+    # prices absent — the reason LineItem prices are Optional.
     received = [
         LineItem(line_id=li.line_id, description=li.description,
                  quantity=li.quantity, unit_of_measure=li.unit_of_measure)
@@ -351,8 +350,7 @@ def main() -> None:
                 records.append(ExtractedRecord(
                     doc=doc,
                     meta=ExtractionMeta(tier=Tier.NONE, layout=layout,
-                                        model_id="generator",
-                                        schema_version=SCHEMA_VERSION)))
+                                        model_id="generator")))
 
     (a.out / "records.jsonl").write_text(
         "\n".join(r.model_dump_json() for r in records) + "\n", encoding="utf-8")
