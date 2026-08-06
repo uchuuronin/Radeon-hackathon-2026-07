@@ -36,12 +36,19 @@ mkdir -p "$OUT"
 # rocm-smi sampled at 1 Hz for the duration of one run. Mean, not peak:
 # a peak is one instant and every run touches 100% briefly during a decode
 # burst. The mean is what "we kept the card busy" actually means.
+#
+# Parsed through bench/gpu_stats.py rather than `grep -oE '[0-9]+'`: the
+# "GPU[0]" device prefix on every rocm-smi line contains a digit of its own,
+# so a blind digit-grab on --showuse --showmemuse output picks up the GPU
+# INDEX in front of the actual use %, and this loop would have logged
+# utilisation as 0 on every sample regardless of the real number. Verified
+# in tests/test_gpu_stats.py against real-format output, not assumed.
 sample_gpu() {
   local out="$1"
   : > "$out"
   while :; do
-    rocm-smi --showuse --showmemuse 2>/dev/null \
-      | grep -oE '[0-9]+' | paste -sd' ' >> "$out"
+    rocm-smi --showuse 2>/dev/null \
+      | python3 "$ROOT/bench/gpu_stats.py" use 2>/dev/null >> "$out"
     sleep 1
   done
 }
@@ -65,13 +72,15 @@ for C in $CONCURRENCIES; do
 import json, sys
 from pathlib import Path
 m = json.loads(Path(sys.argv[1]).read_text())
-util = []
-for line in Path(sys.argv[2]).read_text().splitlines():
-    parts = [int(x) for x in line.split() if x.isdigit()]
-    if parts:
-        util.append(parts[0])
+# One clean integer per line now (bench/gpu_stats.py's job), not a raw
+# digit-soup line to re-parse here.
+util = [int(l) for l in Path(sys.argv[2]).read_text().splitlines() if l.strip().isdigit()]
 mean = sum(util) / len(util) if util else 0
 peak = max(util) if util else 0
+if not util:
+    print(f"WARNING: no GPU-use samples parsed for concurrency {sys.argv[3]} "
+          f"-- mean/peak below are 0 because nothing was read, not because "
+          f"the card was idle. Check rocm-smi is on PATH.", file=sys.stderr)
 print(f"| {sys.argv[3]} | {m['docs_per_s']:.2f} | {mean:.0f} | {peak} | "
       f"{m['latency_p50_ms']:.0f} | {m['latency_p95_ms']:.0f} | "
       f"{m['cache_hit_rate']:.0%} | {m['ok']}/{m['documents']} |")

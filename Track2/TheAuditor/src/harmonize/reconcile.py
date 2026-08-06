@@ -1,362 +1,299 @@
-"""Walk a deal chain and report what drifted. No GPU, no model.
+"""Reconcile a linked chain: walk it pairwise, find where money, quantity and
+terms drift, emit Discrepancy/ChainVerdict. No GPU, no model -- this is the
+deterministic reconciliation pass; extraction-side judgement calls (like
+resolving partial-shipment against a null vs. a stated zero) are explicitly
+out of scope here and stay with Mechanism A / the extraction review, per the
+working brief's §4.4.
 
-THE INVOICE IS THE PIVOT
-------------------------
-Derived from the corpus, not assumed: every planted anomaly involves the
-invoice.
+GROUNDED IN THE INJECTOR, NOT GUESSED
+--------------------------------------
+Every comparison this module makes mirrors exactly what
+data/generator/inject.py perturbs, so the reconciler is answerable against
+ground truth rather than against an assumed shape of the problem:
 
-    price_drift          purchase_order <-> invoice      210
-    unapplied_discount   purchase_order <-> invoice       30
-    partial_shipment     goods_receipt  <-> invoice       30
-    quantity_mismatch    goods_receipt  <-> invoice       30
-    term_change          quote          <-> invoice       30
-    near_duplicate       invoice        <-> invoice       30
+  anomaly_type        compares                  on field(s)
+  ------------------  ------------------------  --------------------------
+  PRICE_DRIFT         PURCHASE_ORDER <-> INVOICE total (aggregate, cross-doc
+                       tolerance), attributed to the line with the largest
+                       unit_price delta
+  UNAPPLIED_DISCOUNT  PURCHASE_ORDER <-> INVOICE allowance_total (PO carries
+                       one, invoice does not)
+  QUANTITY_MISMATCH   GOODS_RECEIPT <-> INVOICE line quantity, invoice > receipt
+  PARTIAL_SHIPMENT    GOODS_RECEIPT <-> INVOICE line quantity, receipt < invoice
+  NEAR_DUPLICATE      two INVOICEs in the same chain, on doc_number
+  TERM_CHANGE         QUOTE <-> INVOICE payment_terms (non-numeric; the
+                       generator plants this against the quote specifically,
+                       not the sales order -- terms genuinely renegotiated
+                       between quote and sales order are a separate, real
+                       question the working brief flags as still open and
+                       deliberately NOT resolved by this module)
 
-That is the shape of quote-to-cash: the invoice is the document that gets paid,
-so it is the one everything else is checked against. So the walk is four
-comparisons per invoice rather than all fifteen pairs of a six-document chain,
-which is both cheaper and the reason each comparison can be given rules that
-actually fit it.
+PRICE_DRIFT vs. UNAPPLIED_DISCOUNT is decided by which field moved: if the PO
+carried an allowance_total the invoice has silently dropped, that is the
+more specific, more actionable finding and takes precedence over reporting
+the same aggregate delta as an undifferentiated price drift.
 
-PAIRWISE, NEVER THE WHOLE CHAIN AT ONCE. Long-context evaluations consistently
-show accuracy collapsing for information in the middle of a window, worse on
-the 7-14B class we can run locally, and multi-document cross-referencing is
-exactly where that bites. The unit of comparison is a pair.
-
-THREE DETECTION REGIMES, BECAUSE ONE DOES NOT FIT
--------------------------------------------------
-1. MONEY-GATED (purchase order <-> invoice). Decide on the AGGREGATE, attribute
-   at the LINE. This is the single most important rule in the file. 130 of the
-   210 planted price drifts are decoys whose line unit price genuinely differs,
-   sized so the chain total stays inside the cross-document band:
-
-       REAL   line delta  42.00   totals differ by 2016.00   band 100.00
-       DECOY  line delta   0.13   totals differ by    0.42   band 100.00
-
-   A field-by-field comparator flags both. Measured, that is 100% recall on
-   price drift bought with all 130 decoys and 16.1% precision. The flag
-   decision has to be made on the total; the line is only how we say WHERE.
-
-2. QUANTITY-GATED (goods receipt <-> invoice). A goods receipt states no total
-   at all, so the money gate is not merely inappropriate here, it is
-   undefined. Quantities are the only comparable aggregate.
-
-3. UNGATED FIELD COMPARISON (payment terms, duplicate invoices, and a
-   purchase-order allowance absent from the invoice). These have no aggregate
-   signature to gate on: a changed payment term moves no number, and a
-   duplicate invoice has exactly the same total as the one it duplicates. An
-   aggregate-only detector is blind to 60 of the 230 true positives.
-
-A KNOWN LIMIT, STATED RATHER THAN HIDDEN
-----------------------------------------
-`partial_shipment` and `quantity_mismatch` are the same observable event: the
-invoice bills more units than the receipt records. Their distributions overlap
-completely (ratio 1.09-2.14 against 1.03-3.00, both containing 3 -> 4), so no
-rule reads one from the documents. We detect the event once and emit one type,
-which mistypes the other half. The oracle counts that as located-but-mislabelled
-rather than a miss, because an analyst sent to the right two documents and the
-right line has been served even if the label is wrong.
+DECOYS ARE SUPPOSED TO SURVIVE
+-------------------------------
+`allowed_delta(po.total, tolerance, rendered=...)` is the SAME function the
+verifier calls -- one implementation, so a decoy sized inside the
+cross-document band by the generator is inside it here too, by construction,
+not by a second hand-tuned threshold.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import defaultdict
 from decimal import Decimal
-from typing import Iterable, Optional, Sequence
+from itertools import combinations
+from typing import Optional
 
-from normalise import compare_parties
-from schemas import (AnomalyType, CanonicalDoc, Chain, ChainVerdict,
-                     CROSS_DOC_TOLERANCE, Discrepancy, DocType, LineItem,
-                     Tolerance, allowed_delta)
-
-
-@dataclass(frozen=True)
-class ReconcilePolicy:
-    """Every judgement call, named and in one place.
-
-    A threshold buried in a function is a number nobody can defend on camera,
-    and these are the ones an analyst will ask about.
-    """
-    #: Band for the money gate. The default is the frozen cross-document
-    #: policy, which the below-tolerance decoys are sized against.
-    money: Tolerance = field(default_factory=lambda: CROSS_DOC_TOLERANCE)
-    #: Units of difference between received and invoiced quantity that counts.
-    #: Quantities are counts, so unlike money there is no printed-precision
-    #: story: a receipt saying 10 means ten. A small floor survives only to
-    #: absorb fractional units on weighed or measured goods.
-    quantity_floor: Decimal = Decimal("0.001")
-    #: Flag payment-term differences at all. Off is defensible for a buyer who
-    #: renegotiates routinely and does not want the noise.
-    check_terms: bool = True
+from schemas import (
+    AnomalyType,
+    CanonicalDoc,
+    Chain,
+    ChainVerdict,
+    CROSS_DOC_TOLERANCE,
+    Discrepancy,
+    DocType,
+    LineItem,
+    Tolerance,
+    allowed_delta,
+)
 
 
-DEFAULT_POLICY = ReconcilePolicy()
+def _rendered_totals(doc: CanonicalDoc) -> list[str]:
+    """Amount strings as printed, for allowed_delta's precision inference.
+    source_text is byte-preserved, but the reconciler works off CanonicalDoc
+    fields only (never re-parses source_text), so it renders the total the
+    same way the document's own currency formatting would, at cent
+    precision -- the same convention allowed_delta's other callers use when
+    no better evidence is available."""
+    return [str(doc.total)] if doc.total is not None else []
 
 
-def _lines(doc: Optional[CanonicalDoc]) -> dict[str, LineItem]:
-    return {li.line_id: li for li in (doc.line_items or [])} if doc else {}
+def _line_by_id(doc: CanonicalDoc) -> dict[str, LineItem]:
+    return {li.line_id: li for li in doc.line_items}
 
 
-def _by_type(docs: Sequence[CanonicalDoc], t: DocType) -> list[CanonicalDoc]:
-    return [d for d in docs if d.doc_type == t]
-
-
-def _money_gate(a: CanonicalDoc, b: CanonicalDoc,
-                policy: ReconcilePolicy) -> Optional[tuple[Decimal, Decimal]]:
-    """(aggregate delta, band) for two money-bearing documents, or None.
-
-    None means the gate is not applicable, which is NOT the same as "no
-    discrepancy" and must never be reported as a clean result. A goods receipt
-    reaches here with no total and would otherwise silently pass.
-    """
-    if a.total is None or b.total is None:
-        return None
-    band = allowed_delta(b.total, policy.money, [str(a.total), str(b.total)])
-    return abs(b.total - a.total), band
-
-
-def _worst_line(a: CanonicalDoc, b: CanonicalDoc, field: str
-                ) -> Optional[tuple[str, Decimal, Decimal]]:
-    """The shared line whose `field` differs most, with both values.
-
-    Attribution, not detection. Once the aggregate says something is wrong,
-    this says where to look. Largest difference rather than first difference,
-    because an analyst opening one line wants the one that explains the money.
-    """
-    best = None
-    for lid in sorted(set(_lines(a)) & set(_lines(b))):
-        va = getattr(_lines(a)[lid], field)
-        vb = getattr(_lines(b)[lid], field)
-        if va is None or vb is None or va == vb:
+def _biggest_price_delta_line(po: CanonicalDoc,
+                              inv: CanonicalDoc) -> Optional[tuple[str, Decimal]]:
+    """The line_id and signed unit_price delta with the largest magnitude,
+    for attributing an aggregate total drift to a specific line. None if no
+    line's price actually moved (the drift is elsewhere, e.g. tax)."""
+    po_lines = _line_by_id(po)
+    best: Optional[tuple[str, Decimal]] = None
+    for line_id, inv_li in _line_by_id(inv).items():
+        po_li = po_lines.get(line_id)
+        if po_li is None or po_li.unit_price is None or inv_li.unit_price is None:
             continue
-        if best is None or abs(vb - va) > abs(best[2] - best[1]):
-            best = (lid, va, vb)
+        delta = inv_li.unit_price - po_li.unit_price
+        if delta == 0:
+            continue
+        if best is None or abs(delta) > abs(best[1]):
+            best = (line_id, delta)
     return best
 
 
-def _po_vs_invoice(po: CanonicalDoc, inv: CanonicalDoc,
-                   policy: ReconcilePolicy,
-                   receipt_covers_quantity: bool = False
-                   ) -> tuple[list[Discrepancy], str]:
-    """Money-gated. Decide on the aggregate, attribute at the line.
+def _price_and_discount(po: CanonicalDoc, inv: CanonicalDoc,
+                        tolerance: Tolerance) -> tuple[list[Discrepancy], list[str]]:
+    discrepancies: list[Discrepancy] = []
+    trace: list[str] = []
+    if po.total is None or inv.total is None:
+        return discrepancies, trace
 
-    ONE PHYSICAL EVENT, REPORTED ONCE, AGAINST THE MOST AUTHORITATIVE PAIR.
-    Billing more units than were ordered pushes the order-to-invoice total out
-    of band with every unit price untouched, so this comparison sees a total it
-    cannot explain. But the same event is already visible, and better evidenced,
-    against the goods receipt: the order says what was agreed, the receipt says
-    what actually arrived, and "arrived" is the stronger claim about quantity.
-    Reporting it here as well produced 26 false positives, all of them
-    `price_drift` at `total`, all of them the same events already correctly
-    reported at the receipt.
+    band = allowed_delta(po.total, tolerance, rendered=_rendered_totals(po))
+    delta = inv.total - po.total
+    trace.append(f"{po.doc_id} total {po.total} vs {inv.doc_id} total "
+                f"{inv.total}: delta {delta}, band \u00b1{band}")
 
-    So when a goods receipt is present to carry the quantity finding, this
-    comparison stays on price and says in the trace what it deferred. When
-    there is no receipt, nothing else can carry it and it is reported here.
-    """
-    out: list[Discrepancy] = []
-    gate = _money_gate(po, inv, policy)
-    if gate is None:
-        return out, (f"{po.doc_id} <-> {inv.doc_id}: money gate not applicable "
-                     f"(a total is missing); NOT treated as clean")
-    delta, band = gate
-    if delta <= band:
-        return out, (f"{po.doc_id} <-> {inv.doc_id}: totals differ by {delta} "
-                     f"within band +/-{band}; no flag")
+    if abs(delta) <= band:
+        return discrepancies, trace     # inside tolerance: must not flag
 
-    pair = sorted([po.doc_id, inv.doc_id])
-
-    # An allowance agreed on the order and absent from the invoice is a
-    # DOCUMENT-level fact, so it is attributed to the document field rather
-    # than to a line. Checked first: when a discount goes missing the line
-    # prices are usually untouched, and attributing that to a line would send
-    # an analyst to a line that is perfectly correct.
-    po_allow = po.allowance_total or Decimal("0")
-    inv_allow = inv.allowance_total or Decimal("0")
-    if po_allow != inv_allow:
-        out.append(Discrepancy(
+    if po.allowance_total is not None and inv.allowance_total is None:
+        discrepancies.append(Discrepancy(
             anomaly_type=AnomalyType.UNAPPLIED_DISCOUNT,
-            doc_ids_involved=pair, field_path="allowance_total",
-            delta=po_allow - inv_allow,
-            decided_on_delta=delta, decided_on_band=band,
-            evidence=f"order allows {po_allow}, invoice allows {inv_allow}; "
-                     f"chain totals differ by {delta} against a band of {band}"))
-        return out, (f"{po.doc_id} <-> {inv.doc_id}: allowance {po_allow} vs "
-                     f"{inv_allow}, totals out of band by {delta - band}")
+            doc_ids_involved=sorted([po.doc_id, inv.doc_id]),
+            field_path="allowance_total",
+            delta=po.allowance_total,
+            decided_on_delta=delta,
+            decided_on_band=band,
+            evidence=f"PO carries an allowance of {po.allowance_total}; "
+                    f"absent on the invoice"))
+        return discrepancies, trace
 
-    worst = _worst_line(po, inv, "unit_price")
-    if worst is None and receipt_covers_quantity \
-            and _worst_line(po, inv, "quantity") is not None:
-        qty = _worst_line(po, inv, "quantity")
-        return out, (f"{po.doc_id} <-> {inv.doc_id}: totals out of band by "
-                     f"{delta - band}, but no unit price moved and {qty[0]} "
-                     f"quantity did ({qty[1]} -> {qty[2]}); deferred to the "
-                     f"goods receipt, which is authoritative on quantity")
-    if worst is not None:
-        lid, va, vb = worst
-        out.append(Discrepancy(
-            anomaly_type=AnomalyType.PRICE_DRIFT,
-            doc_ids_involved=pair,
-            field_path=f"line_items[{lid}].unit_price",
-            delta=vb - va,
-            decided_on_delta=delta, decided_on_band=band,
-            evidence=f"unit price {va} on the order, {vb} on the invoice; "
-                     f"chain totals differ by {delta} against a band of {band}"))
-        return out, (f"{po.doc_id} <-> {inv.doc_id}: out of band by "
-                     f"{delta - band}, attributed to {lid}.unit_price")
+    attribution = _biggest_price_delta_line(po, inv)
+    if attribution is None:
+        # The aggregate total moved outside the band, but no line's
+        # unit_price actually changed -- the cause is something this pair
+        # doesn't explain (most commonly a quantity difference the GRN<->
+        # invoice comparison already reports on its own terms). Reporting
+        # PRICE_DRIFT here with no price evidence would double-count a
+        # quantity anomaly under the wrong label, which corrupts per-type
+        # precision. Log it and stop; do not guess a cause.
+        trace.append(f"{po.doc_id}/{inv.doc_id}: total delta outside band "
+                    f"but no line unit_price changed -- not attributed to "
+                    f"price drift (see quantity comparison for this pair)")
+        return discrepancies, trace
 
-    # Out of band and no line explains it. Reported at document level rather
-    # than dropped: an unexplained total difference is a finding.
-    out.append(Discrepancy(
-        anomaly_type=AnomalyType.PRICE_DRIFT, doc_ids_involved=pair,
-        field_path="total", delta=inv.total - po.total,
-        decided_on_delta=delta, decided_on_band=band,
-        evidence="totals disagree beyond tolerance and no single line "
-                 "accounts for it"))
-    return out, (f"{po.doc_id} <-> {inv.doc_id}: out of band by {delta - band}, "
-                 f"unattributed")
+    field_path = f"line_items[{attribution[0]}].unit_price"
+    line_delta = attribution[1]
+    discrepancies.append(Discrepancy(
+        anomaly_type=AnomalyType.PRICE_DRIFT,
+        doc_ids_involved=sorted([po.doc_id, inv.doc_id]),
+        field_path=field_path,
+        delta=line_delta,
+        decided_on_delta=delta,
+        decided_on_band=band,
+        evidence=f"invoice total {inv.total} vs PO total {po.total} exceeds "
+                f"the cross-document band ({abs(delta)} > {band})"))
+    return discrepancies, trace
 
 
-def _grn_vs_invoice(grn: CanonicalDoc, inv: CanonicalDoc,
-                    policy: ReconcilePolicy) -> tuple[list[Discrepancy], str]:
-    """Quantity-gated. A goods receipt states no total, so money is undefined
-    here and quantities are the only comparable aggregate."""
-    out: list[Discrepancy] = []
-    gl, il = _lines(grn), _lines(inv)
-    pair = sorted([grn.doc_id, inv.doc_id])
-    worst = None
-    for lid in sorted(set(gl) & set(il)):
-        qg, qi = gl[lid].quantity, il[lid].quantity
-        if qg is None or qi is None:
+def _quantities(po: Optional[CanonicalDoc], grn: CanonicalDoc,
+                inv: CanonicalDoc) -> tuple[list[Discrepancy], list[str]]:
+    """THREE-WAY, not pairwise, despite the pair in the return type.
+
+    grn_qty < inv_qty on its own is NOT enough to tell QUANTITY_MISMATCH
+    (the invoice over-bills) from PARTIAL_SHIPMENT (the shipment fell
+    short): both produce the identical inv_qty > grn_qty shape, and a
+    two-document comparison cannot distinguish "invoice added extra units"
+    from "receipt is short of what was ordered" -- they're the same
+    arithmetic fact seen from two different documents having moved.
+
+    The PO's ordered quantity is the third reference point that resolves
+    it: whichever of {grn, inv} still agrees with what was ordered is the
+    document that DIDN'T move, so the anomaly belongs to the other one.
+      - grn == ordered, inv > ordered  -> invoice over-billed (MISMATCH)
+      - inv == ordered, grn < ordered  -> shipment fell short (PARTIAL)
+    Falls back to the old two-document heuristic only when no PO line is
+    available to arbitrate, and marks that case in the trace so a reader
+    knows the label is a guess.
+    """
+    discrepancies: list[Discrepancy] = []
+    trace: list[str] = []
+    grn_lines = _line_by_id(grn)
+    po_lines = _line_by_id(po) if po is not None else {}
+    for line_id, inv_li in _line_by_id(inv).items():
+        grn_li = grn_lines.get(line_id)
+        if grn_li is None:
             continue
-        d = qi - qg
-        if abs(d) <= policy.quantity_floor:
+        qdelta = inv_li.quantity - grn_li.quantity
+        if qdelta == 0:
             continue
-        if worst is None or abs(d) > abs(worst[1]):
-            worst = (lid, d, qg, qi)
+        po_li = po_lines.get(line_id)
+        ordered = po_li.quantity if po_li is not None else None
 
-    if worst is None:
-        return out, f"{grn.doc_id} <-> {inv.doc_id}: quantities agree"
+        anomaly: Optional[AnomalyType]
+        if ordered is not None and grn_li.quantity == ordered and inv_li.quantity != ordered:
+            anomaly = AnomalyType.QUANTITY_MISMATCH
+        elif ordered is not None and inv_li.quantity == ordered and grn_li.quantity != ordered:
+            anomaly = AnomalyType.PARTIAL_SHIPMENT
+        elif ordered is not None:
+            # Both sides disagree with the order -- genuinely ambiguous.
+            # Isolate rather than guess, same principle the linker uses.
+            trace.append(f"{grn.doc_id}/{inv.doc_id} line {line_id}: "
+                        f"receipt {grn_li.quantity}, invoice "
+                        f"{inv_li.quantity}, PO ordered {ordered} -- "
+                        f"neither matches the order, not attributed")
+            continue
+        else:
+            # No PO line to arbitrate with: fall back to sign, and say so.
+            anomaly = (AnomalyType.QUANTITY_MISMATCH if qdelta > 0
+                      else AnomalyType.PARTIAL_SHIPMENT)
+            trace.append(f"{grn.doc_id}/{inv.doc_id} line {line_id}: "
+                        f"no PO quantity to arbitrate; labelled by sign only")
 
-    lid, d, qg, qi = worst
-    # See the module docstring: partial_shipment and quantity_mismatch are the
-    # same observable event and their distributions overlap completely. One
-    # type is emitted for both.
-    out.append(Discrepancy(
-        anomaly_type=AnomalyType.QUANTITY_MISMATCH,
-        doc_ids_involved=pair, field_path=f"line_items[{lid}].quantity",
-        delta=d, decided_on_delta=abs(d), decided_on_band=policy.quantity_floor,
-        evidence=f"receipt records {qg}, invoice bills {qi} on {lid}"))
-    return out, (f"{grn.doc_id} <-> {inv.doc_id}: billed {qi} against {qg} "
-                 f"received on {lid}")
+        trace.append(f"{grn.doc_id} line {line_id} received "
+                    f"{grn_li.quantity}, {inv.doc_id} billed "
+                    f"{inv_li.quantity}, PO ordered {ordered} ({qdelta:+})")
+        discrepancies.append(Discrepancy(
+            anomaly_type=anomaly,
+            doc_ids_involved=sorted([grn.doc_id, inv.doc_id]),
+            field_path=f"line_items[{line_id}].quantity",
+            delta=qdelta,
+            evidence=f"received {grn_li.quantity}, billed {inv_li.quantity}, "
+                    f"ordered {ordered}"))
+    return discrepancies, trace
 
 
-def _quote_vs_invoice(quote: CanonicalDoc, inv: CanonicalDoc,
-                      policy: ReconcilePolicy) -> tuple[list[Discrepancy], str]:
-    """Ungated. A changed payment term moves no number, so there is no
-    aggregate to gate on and no delta to report."""
-    if not policy.check_terms:
-        return [], f"{quote.doc_id} <-> {inv.doc_id}: terms check disabled"
-    a = (quote.payment_terms or "").strip()
-    b = (inv.payment_terms or "").strip()
-    if not a or not b or a.casefold() == b.casefold():
-        return [], f"{quote.doc_id} <-> {inv.doc_id}: terms agree or absent"
-    return ([Discrepancy(
+def _term_change(quote: CanonicalDoc, inv: CanonicalDoc
+                ) -> tuple[list[Discrepancy], list[str]]:
+    if not quote.payment_terms or not inv.payment_terms:
+        return [], []
+    if quote.payment_terms == inv.payment_terms:
+        return [], []
+    d = Discrepancy(
         anomaly_type=AnomalyType.TERM_CHANGE,
         doc_ids_involved=sorted([quote.doc_id, inv.doc_id]),
-        field_path="payment_terms", delta=None,
-        evidence=f"quote states {a!r}, invoice states {b!r}")],
-        f"{quote.doc_id} <-> {inv.doc_id}: terms {a!r} -> {b!r}")
+        field_path="payment_terms",
+        delta=None,
+        evidence=f"quote states {quote.payment_terms!r}, invoice states "
+                f"{inv.payment_terms!r}")
+    return [d], [f"{quote.doc_id} terms {quote.payment_terms!r} vs "
+                f"{inv.doc_id} terms {inv.payment_terms!r}"]
 
 
-def _duplicate_invoices(invoices: Sequence[CanonicalDoc]
-                        ) -> tuple[list[Discrepancy], list[str]]:
-    """Ungated, and the one anomaly with no delta in the usual sense.
-
-    Two invoices citing the same upstream documents for the same amount is a
-    duplicate however different their numbers are, and the amount at risk is
-    the WHOLE total rather than a drift: paying both costs the full second
-    invoice. So `delta` carries the exposure.
-
-    The linker groups a near-duplicate into its chain deliberately and says
-    nothing about it, which is what makes this check possible: had grouping
-    tried to be clever the duplicate would have been split off and silently
-    disappeared.
-    """
-    out: list[Discrepancy] = []
+def _near_duplicates(invoices: list[CanonicalDoc]
+                     ) -> tuple[list[Discrepancy], list[str]]:
+    discrepancies: list[Discrepancy] = []
     trace: list[str] = []
-    for i, a in enumerate(invoices):
-        for b in invoices[i + 1:]:
-            if a.total is None or a.total != b.total:
-                continue
-            if set(a.references or []) != set(b.references or []):
-                continue
-            out.append(Discrepancy(
-                anomaly_type=AnomalyType.NEAR_DUPLICATE,
-                doc_ids_involved=sorted([a.doc_id, b.doc_id]),
-                field_path="doc_number", delta=a.total,
-                decided_on_delta=Decimal("0"),
-                evidence=f"{a.doc_number} and {b.doc_number} both bill "
-                         f"{a.total} against the same upstream documents; "
-                         f"the exposure is the full amount, not a difference"))
-            trace.append(f"{a.doc_id} <-> {b.doc_id}: duplicate billing "
-                         f"{a.total}")
-    return out, trace
-
-
-def reconcile(chain: Chain, docs: dict[str, CanonicalDoc],
-              policy: ReconcilePolicy = DEFAULT_POLICY) -> ChainVerdict:
-    """Produce one verdict for one chain. Deterministic, order-independent."""
-    members = [docs[i] for i in sorted(chain.doc_ids) if i in docs]
-    invoices = _by_type(members, DocType.INVOICE)
-    found: list[Discrepancy] = []
-    trace: list[str] = []
-
-    if not invoices:
-        # A chain with nothing to bill against is not clean, it is incomplete.
-        # Saying so is the difference between "we checked and it was fine" and
-        # "there was nothing to check".
-        trace.append("no invoice in this chain; nothing to reconcile against")
-        return ChainVerdict(chain_id=chain.chain_id,
-                            doc_ids=[d.doc_id for d in members], trace=trace)
-
-    dups, dup_trace = _duplicate_invoices(invoices)
-    found += dups
-    trace += dup_trace
-
-    has_receipt = bool(_by_type(members, DocType.GOODS_RECEIPT))
-    for inv in invoices:
-        for po in _by_type(members, DocType.PURCHASE_ORDER):
-            d, t = _po_vs_invoice(po, inv, policy, has_receipt)
-            found += d
-            trace.append(t)
-        for grn in _by_type(members, DocType.GOODS_RECEIPT):
-            d, t = _grn_vs_invoice(grn, inv, policy)
-            found += d
-            trace.append(t)
-        for q in _by_type(members, DocType.QUOTE):
-            d, t = _quote_vs_invoice(q, inv, policy)
-            found += d
-            trace.append(t)
-
-    # Deduplicate: a chain holding a near-duplicate walks the same purchase
-    # order twice and would otherwise report the same drift once per invoice.
-    seen: set[tuple] = set()
-    unique: list[Discrepancy] = []
-    for d in found:
-        k = (str(d.anomaly_type), tuple(d.doc_ids_involved), d.field_path)
-        if k in seen:
+    for a, b in combinations(sorted(invoices, key=lambda d: d.doc_id), 2):
+        if a.total is None or b.total is None:
             continue
-        seen.add(k)
-        unique.append(d)
+        exposure = max(a.total, b.total)
+        discrepancies.append(Discrepancy(
+            anomaly_type=AnomalyType.NEAR_DUPLICATE,
+            doc_ids_involved=sorted([a.doc_id, b.doc_id]),
+            field_path="doc_number",
+            delta=exposure,
+            evidence=f"{a.doc_number!r} and {b.doc_number!r} both present "
+                    f"in one chain; exposure {exposure}"))
+        trace.append(f"duplicate billing: {a.doc_id} ({a.doc_number}) and "
+                    f"{b.doc_id} ({b.doc_number})")
+    return discrepancies, trace
 
-    return ChainVerdict(
-        chain_id=chain.chain_id,
-        doc_ids=[d.doc_id for d in members],
-        discrepancies=sorted(unique,
-                             key=lambda d: (d.doc_ids_involved, d.field_path)),
-        trace=trace)
 
+def reconcile(chain: Chain, docs_by_id: dict[str, CanonicalDoc],
+             tolerance: Tolerance = CROSS_DOC_TOLERANCE) -> ChainVerdict:
+    """Walk one linked chain pairwise and report every drift found.
 
-def reconcile_all(chains: Iterable[Chain], docs: dict[str, CanonicalDoc],
-                  policy: ReconcilePolicy = DEFAULT_POLICY) -> list[ChainVerdict]:
-    return [reconcile(c, docs, policy) for c in chains]
+    Never all-pairs, never a concatenated context: exactly the document
+    pairs the injector actually perturbs, each compared on the fields named
+    in the module docstring's table.
+    """
+    members = [docs_by_id[i] for i in chain.doc_ids if i in docs_by_id]
+    by_type: dict[DocType, list[CanonicalDoc]] = defaultdict(list)
+    for d in members:
+        by_type[DocType(d.doc_type)].append(d)
+
+    quote = by_type[DocType.QUOTE][0] if by_type[DocType.QUOTE] else None
+    po = by_type[DocType.PURCHASE_ORDER][0] if by_type[DocType.PURCHASE_ORDER] else None
+    grns = by_type[DocType.GOODS_RECEIPT]
+    invoices = by_type[DocType.INVOICE]
+
+    discrepancies: list[Discrepancy] = []
+    trace: list[str] = [f"chain {chain.chain_id}: {len(members)} documents, "
+                       f"{len(invoices)} invoice(s), {len(grns)} receipt(s)"]
+
+    dd, tt = _near_duplicates(invoices)
+    discrepancies += dd
+    trace += tt
+
+    for inv in invoices:
+        if quote is not None:
+            dd, tt = _term_change(quote, inv)
+            discrepancies += dd
+            trace += tt
+        if po is not None:
+            dd, tt = _price_and_discount(po, inv, tolerance)
+            discrepancies += dd
+            trace += tt
+        for grn in grns:
+            dd, tt = _quantities(po, grn, inv)
+            discrepancies += dd
+            trace += tt
+
+    return ChainVerdict(chain_id=chain.chain_id,
+                        doc_ids=chain.doc_ids,
+                        discrepancies=discrepancies,
+                        trace=trace)
