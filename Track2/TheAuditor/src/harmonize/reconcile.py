@@ -1,9 +1,5 @@
 """Walk a linked chain, report what drifted. No GPU, no model.
 
-MERGE NOTE. This is both branches reconciled, not one picked over the other.
-Each had something the other was wrong about, and both claims were settled by
-measurement rather than argument:
-
   FROM THE THREE-WAY BRANCH — `_quantities` arbitration, and it is correct.
     The other branch concluded partial_shipment and quantity_mismatch are
     observationally identical, having compared only the receipt against the
@@ -20,12 +16,22 @@ THE INVOICE IS THE PIVOT
 ------------------------
 Derived from the corpus: every planted anomaly involves the invoice.
 
-    price_drift          purchase_order <-> invoice      210
-    unapplied_discount   purchase_order <-> invoice       30
-    partial_shipment     goods_receipt  <-> invoice       30
-    quantity_mismatch    goods_receipt  <-> invoice       30
-    term_change          quote          <-> invoice       30
-    near_duplicate       invoice        <-> invoice       30
+  anomaly_type        compares                  on field(s)
+  ------------------  ------------------------  --------------------------
+  PRICE_DRIFT         PURCHASE_ORDER <-> INVOICE total (aggregate, cross-doc
+                       tolerance), attributed to the line with the largest
+                       unit_price delta
+  UNAPPLIED_DISCOUNT  PURCHASE_ORDER <-> INVOICE allowance_total (PO carries
+                       one, invoice does not)
+  QUANTITY_MISMATCH   GOODS_RECEIPT <-> INVOICE line quantity, invoice > receipt
+  PARTIAL_SHIPMENT    GOODS_RECEIPT <-> INVOICE line quantity, receipt < invoice
+  NEAR_DUPLICATE      two INVOICEs in the same chain, on doc_number
+  TERM_CHANGE         QUOTE <-> INVOICE payment_terms (non-numeric; the
+                       generator plants this against the quote specifically,
+                       not the sales order -- terms genuinely renegotiated
+                       between quote and sales order are a separate, real
+                       question the working brief flags as still open and
+                       deliberately NOT resolved by this module)
 
 That is the shape of quote-to-cash: the invoice is what gets paid, so it is
 what everything else is checked against. Four comparisons per invoice, not all
@@ -61,9 +67,10 @@ THREE DETECTION REGIMES, BECAUSE ONE DOES NOT FIT
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import defaultdict
 from decimal import Decimal
-from typing import Iterable, Optional, Sequence
+from itertools import combinations
+from typing import Optional
 
 from schemas import (AnomalyType, CanonicalDoc, Chain, ChainVerdict,
                      CROSS_DOC_TOLERANCE, Discrepancy, DocType, LineItem,
@@ -94,7 +101,8 @@ class ReconcilePolicy:
     check_terms: bool = True
 
 
-DEFAULT_POLICY = ReconcilePolicy()
+def _line_by_id(doc: CanonicalDoc) -> dict[str, LineItem]:
+    return {li.line_id: li for li in doc.line_items}
 
 
 def _lines(doc: Optional[CanonicalDoc]) -> dict[str, LineItem]:
@@ -135,8 +143,11 @@ def _worst_line(a: CanonicalDoc, b: CanonicalDoc,
         va, vb = getattr(la[lid], attr), getattr(lb[lid], attr)
         if va is None or vb is None or va == vb:
             continue
-        if best is None or abs(vb - va) > abs(best[2] - best[1]):
-            best = (lid, va, vb)
+        delta = inv_li.unit_price - po_li.unit_price
+        if delta == 0:
+            continue
+        if best is None or abs(delta) > abs(best[1]):
+            best = (line_id, delta)
     return best
 
 
@@ -242,8 +253,8 @@ def _quantities(po: Optional[CanonicalDoc], grn: CanonicalDoc,
         qg, qi = gl[lid].quantity, il[lid].quantity
         if qg is None or qi is None:
             continue
-        d = qi - qg
-        if abs(d) <= policy.quantity_floor:
+        qdelta = inv_li.quantity - grn_li.quantity
+        if qdelta == 0:
             continue
         ordered = pl[lid].quantity if lid in pl else None
 
@@ -410,6 +421,47 @@ def reconcile(chain: Chain, docs: dict[str, CanonicalDoc],
         trace=trace)
 
 
-def reconcile_all(chains: Iterable[Chain], docs: dict[str, CanonicalDoc],
-                  policy: ReconcilePolicy = DEFAULT_POLICY) -> list[ChainVerdict]:
-    return [reconcile(c, docs, policy) for c in chains]
+def reconcile(chain: Chain, docs_by_id: dict[str, CanonicalDoc],
+             tolerance: Tolerance = CROSS_DOC_TOLERANCE) -> ChainVerdict:
+    """Walk one linked chain pairwise and report every drift found.
+
+    Never all-pairs, never a concatenated context: exactly the document
+    pairs the injector actually perturbs, each compared on the fields named
+    in the module docstring's table.
+    """
+    members = [docs_by_id[i] for i in chain.doc_ids if i in docs_by_id]
+    by_type: dict[DocType, list[CanonicalDoc]] = defaultdict(list)
+    for d in members:
+        by_type[DocType(d.doc_type)].append(d)
+
+    quote = by_type[DocType.QUOTE][0] if by_type[DocType.QUOTE] else None
+    po = by_type[DocType.PURCHASE_ORDER][0] if by_type[DocType.PURCHASE_ORDER] else None
+    grns = by_type[DocType.GOODS_RECEIPT]
+    invoices = by_type[DocType.INVOICE]
+
+    discrepancies: list[Discrepancy] = []
+    trace: list[str] = [f"chain {chain.chain_id}: {len(members)} documents, "
+                       f"{len(invoices)} invoice(s), {len(grns)} receipt(s)"]
+
+    dd, tt = _near_duplicates(invoices)
+    discrepancies += dd
+    trace += tt
+
+    for inv in invoices:
+        if quote is not None:
+            dd, tt = _term_change(quote, inv)
+            discrepancies += dd
+            trace += tt
+        if po is not None:
+            dd, tt = _price_and_discount(po, inv, tolerance)
+            discrepancies += dd
+            trace += tt
+        for grn in grns:
+            dd, tt = _quantities(po, grn, inv)
+            discrepancies += dd
+            trace += tt
+
+    return ChainVerdict(chain_id=chain.chain_id,
+                        doc_ids=chain.doc_ids,
+                        discrepancies=discrepancies,
+                        trace=trace)
