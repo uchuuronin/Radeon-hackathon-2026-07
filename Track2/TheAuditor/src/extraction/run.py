@@ -177,9 +177,26 @@ def _parse(raw: str, doc_id: str, source_text: str) -> Optional[CanonicalDoc]:
 def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
                  tier: Tier = Tier.FAST, concurrency: int = 8,
                  guided: bool = True, prompt_id: str = "",
-                 max_tokens: Optional[int] = None) -> tuple[
+                 max_tokens: Optional[int] = None,
+                 n_samples: int = 1) -> tuple[
                      list[ExtractedRecord], RunStats]:
-    """docs: list of (doc_id, source_text, layout)."""
+    """docs: list of (doc_id, source_text, layout).
+
+    `n_samples > 1` requests N sampled extractions per document IN ONE REQUEST.
+    This is the only way the self-consistency signal S2 routes on can exist,
+    and it has to happen HERE, on the card, because the samples cannot be
+    reconstructed afterwards from a single recorded answer.
+
+    Sent as one request with n=N so vLLM shares the prefill and batches the
+    decodes: wall-clock is roughly one generation rather than N sequential
+    ones. The GPU work is genuinely N, which is why the cost model counts N and
+    the wall-clock does not.
+
+    Every sample is emitted as its own ExtractedRecord carrying
+    `meta.n_sample_index`, so the whole set survives to disk and every
+    downstream question about agreement, calibration and routing can be
+    answered on a laptop, forever, with no further GPU time.
+    """
     problems = sanity_check(s for _, s, _ in docs[:20])
     if problems:
         raise RuntimeError("prompt is not cache-safe: " + "; ".join(problems))
@@ -194,15 +211,15 @@ def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
         try:
             texts, usage = llm.complete(build_messages(source_text),
                                         guided_json=schema,
-                                        max_tokens=max_tokens)
+                                        max_tokens=max_tokens, n=n_samples)
         except Exception as exc:                                # noqa: BLE001
-            return doc_id, None, Usage(), layout, f"{type(exc).__name__}: {exc}"
-        return (doc_id, _parse(texts[0], doc_id, source_text), usage, layout,
-                None)
+            return doc_id, [], Usage(), layout, f"{type(exc).__name__}: {exc}"
+        parsed = [_parse(t, doc_id, source_text) for t in texts]
+        return doc_id, parsed, usage, layout, None
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for doc_id, doc, usage, layout, err in pool.map(one, docs):
+        for doc_id, parsed, usage, layout, err in pool.map(one, docs):
             stats.prompt_tokens += usage.prompt_tokens
             stats.completion_tokens += usage.completion_tokens
             stats.cached_tokens += usage.cached_tokens
@@ -214,15 +231,19 @@ def extract_many(docs: list[tuple[str, str, Optional[str]]], llm: LocalVLLM,
                 stats.api_errors += 1
                 stats.errors.append(err)
                 continue
-            if doc is None:
+            if not any(p is not None for p in parsed):
                 stats.parse_failures += 1
                 continue
             stats.ok += 1
-            out.append(ExtractedRecord(
-                doc=doc,
-                meta=ExtractionMeta(model_id=llm.model, tier=tier,
-                                    prompt_id=prompt_id,
-                                    layout=layout if isinstance(layout, str) else None)))
+            for i, doc in enumerate(parsed):
+                if doc is None:
+                    continue        # one bad sample does not lose the others
+                out.append(ExtractedRecord(
+                    doc=doc,
+                    meta=ExtractionMeta(
+                        model_id=llm.model, tier=tier, prompt_id=prompt_id,
+                        n_sample_index=i if n_samples > 1 else None,
+                        layout=layout if isinstance(layout, str) else None)))
     stats.wall_s = time.perf_counter() - t0
     stats.guided = guided_mode() if guided else "off"
     stats.thinking_disabled = thinking_disabled()
@@ -261,12 +282,17 @@ def main() -> None:
                    help="disable guided JSON, to measure what it is worth")
     p.add_argument("--prompt-id", default="baseline")
     p.add_argument("--max-tokens", type=int, default=1024)
+    p.add_argument("--samples", type=int, default=1,
+                   help="sampled extractions per document, in ONE request. "
+                        ">1 is what makes the self-consistency signal exist; "
+                        "it cannot be reconstructed later.")
     a = p.parse_args()
 
     docs = load_sources(a.records, a.limit, a.layout)
     llm = LocalVLLM(model=a.model, base_url=a.base_url)
     recs, stats = extract_many(docs, llm, Tier(a.tier), a.concurrency,
-                               not a.no_guided, a.prompt_id, a.max_tokens)
+                               not a.no_guided, a.prompt_id, a.max_tokens,
+                               a.samples)
 
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text("\n".join(r.model_dump_json() for r in recs) + "\n",
