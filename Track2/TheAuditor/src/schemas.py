@@ -156,6 +156,15 @@ class Tolerance(_Base):
         description="Buffer applied to precision-inferred tolerance. Mirrors "
                     "Beancount's inferred_tolerance_multiplier; 1.1 is its "
                     "documented recommendation.")
+    abs_ceiling: Optional[Decimal] = Field(
+        default=None,
+        description="Upper bound on the PRECISION-INFERRED widening. None = "
+                    "uncapped, which is correct wherever the operands carry "
+                    "genuinely unknown precision. Set it on the document-total "
+                    "identities, where EN 16931 defines a fixed rounding "
+                    "allowance and inference would otherwise be looser than "
+                    "the standard. Does not bound `pct` or `abs_floor`: those "
+                    "answer different questions.")
     mode: Literal["rss", "linear"] = Field(
         default="rss",
         description="How half-ULPs accumulate across the operands of an "
@@ -216,6 +225,30 @@ def allowed_delta(
     if rendered:
         inferred = inferred_tolerance(rendered, tol.inferred_multiplier,
                                       mode=tol.mode)
+        # WHY THE INFERRED WIDENING IS BOUNDED ON THE TOTAL IDENTITIES
+        # -----------------------------------------------------------
+        # Inference reads a document's printed precision as evidence of the
+        # precision it kept, which is right when provenance is unknown. But it
+        # accumulates: three operands printed without decimals give a band of
+        # 0.78, and a one-cent discrepancy disappears inside it. Cent-level
+        # discrepancy is not a rounding artefact to a reconciliation engine, it
+        # is the thing the engine exists to find.
+        #
+        # Measured against CEN's own labelled rule fixtures, unbounded
+        # inference agreed on 43 of 48 (89.6%). Every one of the five misses
+        # was a one-cent break that CEN requires to fail, on operands it prints
+        # as bare integers. EN 16931 answers the same question with a fixed
+        # +/-0.01 rounding allowance regardless of how an operand is written,
+        # so the ceiling is not a fudge factor: it is the standard's own
+        # number, applied where the standard applies it.
+        #
+        # Deliberately NOT global. It is set per check, on the document-total
+        # identities only. A line total is qty x unit price, and a unit price
+        # printed to fewer decimals than it was kept to makes a genuinely wider
+        # product; capping that would manufacture failures rather than find
+        # them. Uncapped inference stays the default everywhere else.
+        if tol.abs_ceiling is not None:
+            inferred = min(inferred, tol.abs_ceiling)
         floor = max(floor, inferred)
     return max(band, floor)
 
@@ -599,15 +632,37 @@ class VerificationReport(_Base):
 #: someone liked.
 HALF_CENT = Decimal("0.005")
 
+#: Ceiling on inferred widening for the document-total identities, i.e. the
+#: point at which we adopt cent-precision semantics instead of inferring.
+#:
+#: HALF_CENT, not 0.01, and the difference is the whole point. CEN implements
+#: BR-CO-13 as `round(sum * 100) div 100` compared to the stated amount, so ANY
+#: difference at cent resolution is an error there. Our comparison is
+#: `abs(delta) <= band`, so a ceiling of 0.01 would put a one-cent break
+#: exactly ON the boundary and pass it: the bug would survive the fix. At
+#: HALF_CENT a one-cent delta fails and a genuine sub-cent rounding artefact
+#: still passes, which is the same partition CEN draws.
+#:
+#: Note what this means honestly: on these four rules the band collapses to the
+#: floor, so precision inference is switched OFF for document totals rather
+#: than merely bounded. That is the intended reading. A total is stated in the
+#: document's currency at cent resolution; treating "250" as evidence the
+#: author only knew the figure to the nearest unit is the wrong inference for
+#: this one field class, however right it is elsewhere.
+EN16931_TOTALS_CEILING = HALF_CENT
+
 DEFAULT_TOLERANCES: dict[CheckName, Tolerance] = {
     # Internal arithmetic must be near-exact — a document that does not add
     # up internally is a genuine extraction or authoring error.
     CheckName.BR_CO_10:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=HALF_CENT),
+                                   abs_floor=HALF_CENT,
+                                   abs_ceiling=EN16931_TOTALS_CEILING),
     CheckName.BR_CO_13:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=HALF_CENT),
+                                   abs_floor=HALF_CENT,
+                                   abs_ceiling=EN16931_TOTALS_CEILING),
     CheckName.BR_CO_15:  Tolerance(pct=Decimal("0"), abs_cap=Decimal("0.05"),
-                                   abs_floor=HALF_CENT),
+                                   abs_floor=HALF_CENT,
+                                   abs_ceiling=EN16931_TOTALS_CEILING),
     CheckName.LINE_NET_AMOUNT: Tolerance(pct=Decimal("0"),
                                          abs_cap=Decimal("0.05"),
                                          abs_floor=HALF_CENT),
@@ -615,7 +670,8 @@ DEFAULT_TOLERANCES: dict[CheckName, Tolerance] = {
     # allowed_delta; the entry exists so every CheckName has a policy row.
     CheckName.BR_CO_16: Tolerance(pct=Decimal("0"),
                                   abs_cap=Decimal("0.05"),
-                                  abs_floor=HALF_CENT),
+                                  abs_floor=HALF_CENT,
+                                  abs_ceiling=EN16931_TOTALS_CEILING),
     CheckName.BR_DEC_MAX_2: Tolerance(pct=Decimal("0"),
                                       abs_cap=Decimal("0"),
                                       abs_floor=Decimal("0")),

@@ -4,7 +4,7 @@ pydantic>=2.6
 pytest>=8.0
 ruff>=0.4
 
-# Person B only, on the Radeon instance. An OpenAI-compatible CLIENT pointed at
+# Serving side only, on the Radeon instance. An OpenAI-compatible CLIENT pointed at
 # a LOCAL vLLM endpoint — the library is local and no remote endpoint is ever
 # configured. Named here because the README dependency audit must explain it.
 # openai>=1.0

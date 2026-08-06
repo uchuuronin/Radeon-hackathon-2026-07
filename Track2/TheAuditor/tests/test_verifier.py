@@ -256,11 +256,23 @@ def _doc(**kw) -> CanonicalDoc:
     return CanonicalDoc(**base)
 
 
-def test_aggregate_rounding_lands_within_tolerance_not_fail():
-    """Three cent-precision lines of 33.33 sum to 99.99; the document states
-    a whole-unit subtotal of 100. Delta 0.01, band inferred from the stated
-    precisions ≈ 0.57 — WITHIN_TOLERANCE. A fixed-floor verifier
-    would have flagged this legitimate rounding on every such document."""
+def test_a_whole_cent_on_a_document_total_now_fails():
+    """THE COST OF THE EN 16931 CEILING, stated as a test rather than left to
+    be discovered.
+
+    Three cent-precision lines of 33.33 sum to 99.99; the document states a
+    whole-unit subtotal of 100. Delta is one cent. This case previously landed
+    WITHIN_TOLERANCE, because inference read "100" as a figure the author only
+    knew to the nearest unit and opened a band of ~0.57.
+
+    It now FAILS, and that is the intended behaviour: CEN's own labelled
+    fixtures require exactly this to fail, and a cent-level discrepancy on a
+    document total is the thing a reconciliation engine exists to find. The
+    trade is real though — a document that genuinely prints rounded whole-unit
+    totals will now be flagged where it used to pass, so the ceiling buys
+    agreement with the standard at the price of some escalation volume on
+    low-precision sources.
+    """
     lines = [LineItem(line_id=f"LI-{i}", description="unit",
                       quantity=Decimal(1), unit_price=Decimal("33.33"),
                       line_total=Decimal("33.33")) for i in range(1, 4)]
@@ -268,8 +280,24 @@ def test_aggregate_rounding_lands_within_tolerance_not_fail():
                source_text="3 x 33.33, total about 100")
     r = verify_doc(doc)
     br10 = next(c for c in r.checks if c.check == CheckName.BR_CO_10)
+    assert br10.outcome == CheckOutcome.FAIL
+    assert not r.verify_pass
+
+
+def test_sub_cent_rounding_is_still_forgiven():
+    """The ceiling narrows the band; it does not switch to exact equality.
+
+    Without this, WITHIN_TOLERANCE would be dead code on the total identities
+    and the three-outcome semantics would quietly have become two.
+    """
+    lines = [LineItem(line_id=f"LI-{i}", description="unit",
+                      quantity=Decimal(1), unit_price=Decimal("33.333"),
+                      line_total=Decimal("33.333")) for i in range(1, 4)]
+    doc = _doc(line_items=lines, subtotal=Decimal("100.00"),
+               source_text="3 x 33.333, total 100.00")
+    r = verify_doc(doc)
+    br10 = next(c for c in r.checks if c.check == CheckName.BR_CO_10)
     assert br10.outcome == CheckOutcome.WITHIN_TOLERANCE
-    assert r.verify_pass and not r.strict_pass
 
 
 def test_beyond_the_band_fails():

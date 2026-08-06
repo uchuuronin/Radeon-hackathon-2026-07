@@ -179,20 +179,45 @@ class TestUblReader:
 
 
 class TestPrecisionSemanticsAreSelectable:
-    """The one genuine disagreement with CEN, made explicit rather than hidden.
+    """Document totals use cent-precision semantics; everything else infers.
 
-    Their fixtures state a tax amount as "250" and a gross total one cent off,
-    and call it an error. Inference says "250" could have been 249.5, so a cent
-    is nothing. Both readings are right for their own context: inference for
-    documents of unknown provenance, strict for a conformant e-invoice where
-    the standard already fixes the precision.
+    CEN's fixtures state a tax amount as "250" and a gross total one cent off,
+    and call it an error. Unbounded inference said "250" could have been 249.5,
+    so a cent was nothing, and we disagreed with the standard on 5 of its 48
+    labelled fixtures. Every miss was a one-cent break.
+
+    That is the wrong trade for this field class. A cent-level discrepancy on a
+    document total is not a rounding artefact to a reconciliation engine, it is
+    the thing the engine exists to find. So the total identities carry an
+    abs_ceiling and inference is bounded there, while the line-level and
+    cross-document checks keep it.
     """
 
-    def test_inference_widens_the_band_for_a_low_precision_operand(self):
+    def test_total_identities_do_not_widen_past_cent_resolution(self):
         from schemas import DEFAULT_TOLERANCES, CheckName, allowed_delta
         tol = DEFAULT_TOLERANCES[CheckName.BR_CO_15]
-        loose = allowed_delta(Decimal("1250.00"), tol, ["1000.00", "250"])
-        assert loose > Decimal("0.01")          # a cent is inside the band
+        band = allowed_delta(Decimal("1250.00"), tol, ["1000.00", "250"])
+        # A one-cent break must FAIL. Note the strict inequality: the check
+        # compares `abs(delta) <= band`, so a ceiling of 0.01 would sit a cent
+        # exactly ON the boundary and pass it. The half-cent is what actually
+        # draws the partition CEN draws.
+        assert Decimal("0.01") > band
+        # ...while a genuine sub-cent rounding artefact still passes, so this
+        # is a narrowing, not a switch to exact equality.
+        assert Decimal("0.004") <= band
+
+    def test_inference_still_widens_where_precision_is_genuinely_unknown(self):
+        """The ceiling is deliberately NOT global.
+
+        A line total is qty x unit price. A unit price printed to fewer
+        decimals than it was kept to makes the product genuinely wider, so
+        capping it would manufacture failures rather than find them.
+        """
+        from schemas import DEFAULT_TOLERANCES, CheckName, allowed_delta
+        tol = DEFAULT_TOLERANCES[CheckName.LINE_NET_AMOUNT]
+        assert tol.abs_ceiling is None
+        band = allowed_delta(Decimal("6792.50"), tol, ["50", "135.85"])
+        assert band > Decimal("0.5")
 
     def test_strict_mode_allows_only_the_floor(self):
         from schemas import (DEFAULT_TOLERANCES, STRICT_PRECISION, CheckName,

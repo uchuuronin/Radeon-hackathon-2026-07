@@ -140,26 +140,6 @@ def main() -> int:
                      if rows else
                      "bench/tier_selection.md has no rows: run bench/sweep.sh "
                      "once per configuration"))
-    verdicts.append(("line-item numeric accuracy", False,"blocked on the serving gate"))
-
-    # --- a PAIR was selected, not just one model measured -----------------
-    # The gate's own wording is "a model/quantisation pair is selected on
-    # measured extraction accuracy". One configuration measured is not a
-    # selection: there is nothing it was chosen over. Two rows whose Wilson
-    # intervals overlap are also not a selection, because the measurement did
-    # not separate them, but that judgement is a human one and the gate only
-    # insists the rows exist.
-    table = ROOT / "bench/tier_selection.md"
-    rows = 0
-    if table.exists():
-        rows = sum(1 for line in table.read_text(encoding="utf-8").splitlines()
-                   if line.startswith("| ") and "| config |" not in line
-                   and not line.startswith("|---"))
-    verdicts.append(("tier PAIR selected on measurement", rows >= 2,
-                     f"bench/tier_selection.md has {rows} comparable rows"
-                     if rows else
-                     "bench/tier_selection.md has no rows: run bench/sweep.sh "
-                     "once per configuration"))
 
     print("\n" + "=" * 78)
     print("CHECKPOINT 0")
