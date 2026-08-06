@@ -48,7 +48,7 @@ carries the standards mapping; the field name carries the readability.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from contextvars import ContextVar
@@ -835,6 +835,74 @@ class ChainVerdict(_Base):
     @property
     def is_clean(self) -> bool:
         return not self.discrepancies
+
+
+# ---------------------------------------------------------------------------
+# Memory — resolutions worth remembering (Mechanism C)
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE, NOT WIRE-BREAKING. Same argument as Chain and Discrepancy:
+# CanonicalDoc does not reference these, so the extraction schema and the
+# frozen prompt prefix are unchanged.
+
+
+class ResolutionKind(str, Enum):
+    """WHAT an analyst decided, as a closed set.
+
+    The signature migrates a pattern from the slow path to the fast one once
+    enough matching resolutions agree, and matching requires collision. Free
+    text does not collide: two analysts write "freight billed separately" and
+    "freight is on a separate invoice" for the same decision, the signature
+    never accumulates its k confirmations, and the mechanism silently never
+    fires. So the enum is what the signature hashes.
+
+    The free-text `pattern` on the episode carries how a human said it, because
+    an audit line reading WITHIN_AGREED_TERMS alone is unreadable at review
+    time. One collides, the other explains; pointing one at the other gets both.
+    """
+    #: The billed figure is correct as it stands.
+    ACCEPT_AS_BILLED = "accept_as_billed"
+    #: The discrepancy is real and money is owed back.
+    REQUEST_CREDIT = "request_credit"
+    #: Real difference, but covered by something agreed outside this chain.
+    WITHIN_AGREED_TERMS = "within_agreed_terms"
+    #: Our own extraction or linking was wrong, not the documents.
+    EXTRACTION_ERROR = "extraction_error"
+    #: Needs the counterparty. NOT a resolution, and deliberately in the enum
+    #: so it can be recorded WITHOUT ever being counted towards migration: a
+    #: pattern nobody has actually settled must not become an auto-resolve.
+    ESCALATE_TO_VENDOR = "escalate_to_vendor"
+
+    @property
+    def settles(self) -> bool:
+        return self is not ResolutionKind.ESCALATE_TO_VENDOR
+
+
+class MemoryEpisode(_Base):
+    """One human-approved resolution, with the provenance that makes it
+    defensible.
+
+    GATED ENTRY IS THE POINT. Unfiltered agent memory is a documented poisoning
+    vector: small poisoned sets reliably outcompete benign experiences in
+    retrieval, and goal-adjacent poisoned memories are used in most agentic
+    evaluations across frontier models. There is also little peer-reviewed
+    evidence that naive episodic memory improves accuracy on its own without
+    curation. So this is not "the agent learns". It is curated precedent
+    lookup, every entry traceable to a named human, and that framing is both
+    honest and the stronger security claim.
+    """
+    signature: str
+    party_name: str
+    anomaly_type: AnomalyType
+    resolution_kind: ResolutionKind
+    #: How the approver described it. Never hashed, always shown.
+    pattern: str = ""
+    #: Named. An audit line reading "approved by someone" is not an audit line.
+    approver: str
+    approved_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc))
+    chain_id: str = ""
+    field_path: str = ""
 
 
 # ---------------------------------------------------------------------------
