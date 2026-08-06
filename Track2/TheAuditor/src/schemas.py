@@ -685,6 +685,159 @@ CROSS_DOC_TOLERANCE = Tolerance(pct=Decimal("0.02"),
 
 
 # ---------------------------------------------------------------------------
+# Linking — documents grouped into the deal they belong to
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE, NOT WIRE-BREAKING. CanonicalDoc does not reference these types, so
+# they never enter its $defs, the extraction schema is unchanged, and the
+# frozen prompt prefix is byte-identical. Verified: prefix sha256 prefix
+# 9d84942d7b81c742 before and after. No benchmark needs re-running.
+
+
+class LinkMethod(str, Enum):
+    """HOW an edge was established, carried on the edge itself.
+
+    Not decoration. The product claim is that links are INFERRED rather than
+    read from a fixed key, and a claim like that is only worth what the audit
+    trail behind it is worth. An analyst looking at a flagged deal needs to
+    know whether these documents were joined because one literally cited the
+    other, or because we decided a mistyped identifier probably meant this one,
+    or because the party and dates and amounts happened to agree.
+
+    Ordered cheapest and safest first, mirroring the escalation ladder: every
+    document exits at the earliest method that resolves it.
+    """
+    #: The reference resolved verbatim to a known document number.
+    EXACT_REFERENCE = "exact_reference"
+    #: The reference resolved to SEVERAL documents, and an independent
+    #: attribute picked one. Document numbers are not globally unique in
+    #: practice: real systems run per-vendor or per-year sequences, and the
+    #: corpus reproduces that (92 numbers held by two documents each). Refusing
+    #: every ambiguous reference costs real recall; guessing merges unrelated
+    #: deals. Resolving on a second, independent field does neither.
+    DISAMBIGUATED_REFERENCE = "disambiguated_reference"
+    #: The reference did not resolve, but exactly one known document number is
+    #: one character-confusion away from it (0/O, 1/l). Identifiers are the
+    #: hardest field class in every published extraction comparison, and this
+    #: is the failure they actually exhibit.
+    REPAIRED_REFERENCE = "repaired_reference"
+    #: No usable reference. Joined on party AND date proximity AND amount.
+    ATTRIBUTE_MATCH = "attribute_match"
+
+
+class LinkEdge(_Base):
+    """One inferred join between two documents, with its provenance."""
+    from_doc_id: str
+    to_doc_id: str
+    method: LinkMethod
+    #: The reference string as printed, before any repair. Kept so a repair is
+    #: always reversible and always visible: "we read PO-9567-A where the
+    #: document said PO-9S67-A" is a claim an analyst can overrule.
+    stated_reference: Optional[str] = None
+    #: Populated for REPAIRED_REFERENCE and ATTRIBUTE_MATCH. Free text, human
+    #: readable, part of the audit record.
+    rationale: str = ""
+
+
+class Chain(_Base):
+    """A set of documents believed to belong to one deal.
+
+    The linker GROUPS and nothing else. It does not judge, does not compare
+    amounts, and does not flag duplicates. A chain containing two invoices
+    against the same purchase order is a correctly linked chain; whether that
+    is a duplicate is the reconciler's question, and keeping the two concerns
+    apart is what stops a grouping bug from presenting as a false discrepancy.
+    """
+    chain_id: str
+    doc_ids: list[str] = Field(default_factory=list)
+    edges: list[LinkEdge] = Field(default_factory=list)
+    #: References that named a document we never saw. NOT an error: a corpus
+    #: sliced by date or party will legitimately contain half a chain. Recorded
+    #: because a rising count is the signal that the linker is being fed a
+    #: partial view, which would otherwise present as unexplained discrepancies
+    #: further down the pipeline.
+    dangling_references: list[str] = Field(default_factory=list)
+
+    @property
+    def is_singleton(self) -> bool:
+        """A document we could not attach to anything. Worth surfacing rather
+        than hiding: it is either a genuinely standalone document or a link we
+        failed to make, and those need different responses."""
+        return len(self.doc_ids) <= 1
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation — what drifted between two documents in a chain
+# ---------------------------------------------------------------------------
+#
+# ADDITIVE, NOT WIRE-BREAKING. Same argument as Chain: CanonicalDoc does not
+# reference these, so the extraction schema and the frozen prefix are unchanged.
+#
+# THE SHAPE IS DERIVED FROM THE ANSWER KEY, NOT INVENTED
+# -----------------------------------------------------
+# Every planted anomaly in the corpus is exactly a two-document, one-field
+# claim with a signed delta (or no delta, for the one non-numeric type). A
+# Discrepancy that did not carry those four things could not be matched against
+# ground truth, so precision and recall would be undefined. Designing the
+# output shape before knowing how it is scored is how a system ends up
+# measurable only by the metric that flatters it.
+
+
+class Discrepancy(_Base):
+    """One drift, between exactly two documents, at one field path.
+
+    PAIRWISE ON PURPOSE. Long-context evaluations consistently show accuracy
+    collapsing for information in the middle of a window, worse on the 7-14B
+    class we can run locally, and multi-document cross-referencing is exactly
+    where that bites. Whole chains are never concatenated into one prompt, so
+    the unit of reasoning is a pair and the unit of reporting matches it.
+    """
+    anomaly_type: AnomalyType
+    #: Unordered in meaning, sorted on construction so two reconcilers that
+    #: walked the chain in opposite directions produce comparable output.
+    doc_ids_involved: list[str] = Field(min_length=2, max_length=2)
+    #: Same dotted convention as the answer key, LINE IDs not indices:
+    #: 'total', 'payment_terms', 'line_items[LI-003].unit_price'. Indices would
+    #: break the moment extraction dropped or reordered a line, which is
+    #: precisely when attribution matters most.
+    field_path: str
+    #: Signed, in the direction (later document - earlier document). None for
+    #: non-numeric drift such as a change of payment terms.
+    delta: Optional[Decimal] = None
+    #: The aggregate difference the FLAG decision was actually made on, and the
+    #: band it was judged against.
+    #:
+    #: These two are not decoration and not the same as `delta`. A decoy in the
+    #: corpus has a genuinely different unit price on a line, so a field-by-
+    #: field comparator flags it and is wrong: 130 of the 210 planted price
+    #: drifts are sized so the CHAIN total stays inside the cross-document
+    #: band. Detection happens on the aggregate, attribution happens at the
+    #: line, and a Discrepancy that cannot show both cannot be defended.
+    decided_on_delta: Optional[Decimal] = None
+    decided_on_band: Optional[Decimal] = None
+    evidence: str = ""
+
+
+class ChainVerdict(_Base):
+    """The reconciler's output for one chain: what drifted, and what it cost.
+
+    A chain with no discrepancies is a verdict, not an absence of one. 150 of
+    the 510 chains are clean by construction, and a reconciler that emits
+    nothing for them is indistinguishable from a reconciler that crashed.
+    """
+    chain_id: str
+    doc_ids: list[str] = Field(default_factory=list)
+    discrepancies: list[Discrepancy] = Field(default_factory=list)
+    #: Free-text, human-readable, one line per pair walked. The audit record,
+    #: wired in from the start rather than retrofitted.
+    trace: list[str] = Field(default_factory=list)
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.discrepancies
+
+
+# ---------------------------------------------------------------------------
 # Interchange conventions (not code, but part of the contract)
 # ---------------------------------------------------------------------------
 # - Batches: JSONL, one ExtractedRecord per line, UTF-8.

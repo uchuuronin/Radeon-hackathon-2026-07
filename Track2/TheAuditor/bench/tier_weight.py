@@ -136,8 +136,9 @@ def main() -> int:
 
     print(f"\n  To adopt it, edit src/ladder.py:\n"
           f"      TIER_WEIGHT[Rung.PRECISE_TIER] = {weight:.2f}\n"
-          f"  and tell A, because every cost-per-document figure already "
-          f"recorded was computed against 3.0 and is void.")
+          f"  and re-run anything that reported cost per document: every "
+          f"such figure\n  already recorded was computed against 3.0 and is "
+          f"void.")
     return 1 if problems else 0
 
 
