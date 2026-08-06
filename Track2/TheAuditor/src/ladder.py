@@ -92,9 +92,10 @@ class Rung(str, Enum):
         return self in (Rung.FAST_TIER, Rung.PRECISE_TIER)
 
 
-#: Relative cost of one inference call at each tier. PROVISIONAL until Person
-#: B's Stage 0 sweep measures the real ratio on the W7900 — the point is that
-#: this is a measured input, not a constant we invented.
+#: Relative cost of one inference call at each tier. PROVISIONAL until the
+#: Stage 0 sizing sweep measures the real ratio on the W7900 — the point is
+#: that this is a measured input, not a constant we invented.
+#: bench/tier_weight.py computes it from two run manifests.
 TIER_WEIGHT: dict[Rung, float] = {
     Rung.FAST_TIER: 1.0,
     Rung.PRECISE_TIER: 3.0,

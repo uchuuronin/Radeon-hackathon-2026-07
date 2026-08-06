@@ -1,4 +1,4 @@
-"""B5 — score extraction against ground truth. No GPU, no network.
+"""Score extraction against ground truth. No GPU, no network.
 
 THE ONE NUMBER THAT DECIDES THE TIER PAIR
 -----------------------------------------
@@ -97,6 +97,16 @@ class Miss:
 @dataclass
 class Score:
     n: dict[FieldClass, int] = field(default_factory=lambda: dict.fromkeys(CLASSES, 0))
+    #: Truth documents the run never sent. NOT failures. Kept apart from
+    #: parse_failures because a sweep runs --limit 60 against a 6180-document
+    #: corpus, and folding the other 6120 in would print "6120 of 6180
+    #: documents did not yield a valid record" on every row: a headline number
+    #: that is pure artefact of the limit and says nothing about the model.
+    not_attempted: int = 0
+    #: Calls that never reached the model, read from the run manifest. The
+    #: scorer alone cannot tell these from a model that answered unusably,
+    #: because both leave no record, and they are opposite findings.
+    api_errors: int = 0
     exact: dict[FieldClass, int] = field(default_factory=lambda: dict.fromkeys(CLASSES, 0))
     relaxed: dict[FieldClass, int] = field(default_factory=lambda: dict.fromkeys(CLASSES, 0))
     precision_loss: int = 0
@@ -116,9 +126,21 @@ class Score:
 
     def render(self, label: str = "") -> str:
         L = [f"## {label}" if label else "## extraction score", ""]
+        if self.not_attempted:
+            L.append(f"scored {self.docs} of {self.docs + self.not_attempted} "
+                     f"corpus documents ({self.not_attempted} not sent this run)")
         if self.parse_failures:
-            L.append(f"PARSE FAILURES: {self.parse_failures} of {self.docs} "
-                     f"documents did not yield a valid record at all")
+            unusable = self.parse_failures - self.api_errors
+            L.append(f"NO RECORD: {self.parse_failures} of {self.docs} "
+                     f"attempted documents produced nothing scoreable")
+            if self.api_errors:
+                L.append(f"  of which {self.api_errors} never reached the "
+                         f"model at all (server errors, not extraction "
+                         f"failures). This row is about the RUN, not the "
+                         f"model, and must not be used to eliminate a "
+                         f"configuration.")
+            if unusable > 0 and self.api_errors:
+                L.append(f"  and {unusable} were answered but unparseable.")
         L.append(f"{'class':<14}{'n':>6}  {'exact':>22}  {'relaxed':>22}")
         for cls in CLASSES:
             if not self.n[cls]:
@@ -140,6 +162,62 @@ class Score:
                 L.append("  ^ interval wider than 20 points: score more "
                          "documents before choosing on this.")
         return "\n".join(L)
+
+    #: The agreed column order. A row missing any of these is not
+    #: comparable to another row, and comparing them anyway is how a tier gets
+    #: chosen on noise.
+    COLUMNS = ("config", "guided", "mode", "n", "line_numeric", "identifier",
+               "doc_numeric", "precision_loss", "cache", "docs/s @ util",
+               "peak VRAM", "run health")
+
+    def row(self, config: str, manifest: Optional[dict] = None,
+            mode: str = "relaxed", vram_gb: Optional[float] = None,
+            utilisation: Optional[int] = None) -> str:
+        """One markdown table row, for bench/tier_selection.md.
+
+        Every accuracy carries its Wilson interval inline rather than in a
+        footnote, because the decision the table exists for is "are these two
+        configurations distinguishable", and that is an interval question. Two
+        rows whose intervals overlap have not been separated by this
+        measurement however different their point estimates look.
+        """
+        m = manifest or {}
+
+        def cell(cls: str) -> str:
+            if not self.n[cls]:
+                return "n/a"
+            p, lo, hi = self.rate(cls, mode)
+            return f"{p:.1%} [{lo:.0%},{hi:.0%}]"
+
+        thr = m.get("docs_per_s")
+        thr_s = "not measured" if thr is None else (
+            f"{thr:.2f}" + (f" @ {utilisation}%" if utilisation is not None
+                            else " @ UTILISATION NOT RECORDED"))
+        health = (f"{m.get('ok', self.docs)}/{m.get('documents', self.docs)} ok")
+        for k, lab in (("parse_failures", "parse"), ("api_errors", "api"),
+                       ("truncated", "trunc")):
+            if m.get(k):
+                health += f", {m[k]} {lab}"
+        cache = m.get("cache_hit_rate")
+        return "| " + " | ".join([
+            config,
+            str(m.get("guided", "?")),
+            mode,
+            str(self.n["line_numeric"]),
+            cell("line_numeric"),
+            cell("identifier"),
+            cell("doc_numeric"),
+            str(self.precision_loss),
+            "?" if cache is None else f"{cache:.0%}",
+            thr_s,
+            "not measured" if vram_gb is None else f"{vram_gb:.1f} GB",
+            health,
+        ]) + " |"
+
+    @classmethod
+    def header(cls) -> str:
+        return ("| " + " | ".join(cls.COLUMNS) + " |\n|"
+                + "|".join(["---"] * len(cls.COLUMNS)) + "|")
 
     def top_misses(self, k: int = 10) -> str:
         if not self.misses:
@@ -236,8 +314,23 @@ def load_jsonl(path: Path) -> dict[str, CanonicalDoc]:
     return out
 
 
+def attempted_ids(got_path: Path) -> Optional[set[str]]:
+    """Which documents the run actually sent, from the manifest beside the
+    output. Written by run.py.
+
+    Without this the scorer cannot tell "the model failed on this document"
+    from "this document was never sent", and those are opposite findings.
+    """
+    manifest = got_path.with_suffix(".manifest.json")
+    if not manifest.exists():
+        return None
+    ids = json.loads(manifest.read_text(encoding="utf-8")).get("doc_ids")
+    return set(ids) if ids else None
+
+
 def score_files(truth_path: Path, got_path: Path,
-                layout: Optional[str] = None) -> Score:
+                layout: Optional[str] = None,
+                attempted: Optional[set[str]] = None) -> Score:
     truth = load_jsonl(truth_path)
     if layout:
         keep = {r["doc"]["doc_id"] for r in
@@ -246,15 +339,35 @@ def score_files(truth_path: Path, got_path: Path,
                 if r["meta"].get("layout") == layout}
         truth = {k: v for k, v in truth.items() if k in keep}
     got = load_jsonl(got_path)
+    if attempted is None:
+        attempted = attempted_ids(got_path)
 
     s = Score()
     for doc_id, want in truth.items():
+        if attempted is not None and doc_id not in attempted:
+            s.not_attempted += 1
+            continue
         have = got.get(doc_id)
         if have is None:
+            if attempted is None:
+                # No manifest: we cannot distinguish a failure from a document
+                # that was never sent, so we do not guess. Say so rather than
+                # inventing a number in either direction.
+                s.not_attempted += 1
+                continue
             s.parse_failures += 1
             s.docs += 1
             continue
         score_doc(want, have, s)
+    manifest = got_path.with_suffix(".manifest.json")
+    if manifest.exists():
+        s.api_errors = json.loads(
+            manifest.read_text(encoding="utf-8")).get("api_errors", 0) or 0
+    if attempted is None and s.not_attempted:
+        print(f"  [score] no manifest beside {got_path.name}: "
+              f"{s.not_attempted} truth documents had no extraction and are "
+              f"EXCLUDED rather than counted as failures. Re-run through "
+              f"run.py so the manifest records which documents were sent.")
     return s
 
 
@@ -268,11 +381,34 @@ def main() -> None:
     p.add_argument("--layout", default=None, help="score one layout only")
     p.add_argument("--label", default="", help="model x quantisation, for the row")
     p.add_argument("--misses", type=int, default=10)
+    p.add_argument("--mode", default="relaxed", choices=["relaxed", "exact"],
+                   help="which number the ROW reports; both are always printed")
+    p.add_argument("--append-row", type=Path, default=None,
+                   help="append a comparable row to bench/tier_selection.md")
+    p.add_argument("--vram-gb", type=float, default=None,
+                   help="peak VRAM from rocm-smi, NOT from the model card")
+    p.add_argument("--utilisation", type=int, default=None,
+                   help="mean GPU utilisation during the run, from rocm-smi. "
+                        "Throughput without it is not a systems result.")
     a = p.parse_args()
 
     s = score_files(a.truth, a.got, a.layout)
     print(s.render(a.label))
     print(s.top_misses(a.misses))
+
+    if a.append_row:
+        manifest = a.got.with_suffix(".manifest.json")
+        m = json.loads(manifest.read_text(encoding="utf-8")) \
+            if manifest.exists() else {}
+        a.append_row.parent.mkdir(parents=True, exist_ok=True)
+        if not a.append_row.exists() or "| config |" not in \
+                a.append_row.read_text(encoding="utf-8"):
+            with a.append_row.open("a", encoding="utf-8") as fh:
+                fh.write("\n" + Score.header() + "\n")
+        with a.append_row.open("a", encoding="utf-8") as fh:
+            fh.write(s.row(a.label or a.got.parent.name, m, a.mode,
+                           a.vram_gb, a.utilisation) + "\n")
+        print(f"\n  appended row -> {a.append_row}")
 
 
 if __name__ == "__main__":

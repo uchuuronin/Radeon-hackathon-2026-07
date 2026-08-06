@@ -1,4 +1,4 @@
-"""A4 fixture integrity — the independent re-check of hand-written arithmetic.
+"""Fixture integrity — the independent re-check of hand-written arithmetic.
 
 The fixtures exist to be the oracle that gen.py cannot contaminate; this file
 exists so a hand-computation typo cannot contaminate the oracle. Every

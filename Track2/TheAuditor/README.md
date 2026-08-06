@@ -37,7 +37,7 @@ itself — so routing needs no fragile learned calibration to function.
     bench/          conformance harness + extraction scorer
     vendor/         CEN artefacts, fetched not committed
     config/         policy.json — auto-resolve gate, per-vendor date order
-    bench/, infra/  Person B: model serving, quantisation sweeps, versions
+    bench/, infra/  model serving, quantisation sweeps, pinned versions
 
 ## Reproduce (any machine, no GPU required for this half)
 
@@ -85,7 +85,7 @@ Dev: pytest, ruff. Verify it yourself:
 
     grep -rE "^\s*(import|from)\s+(requests|httpx|urllib|socket|openai|anthropic|torch|vllm|boto3|google)" src/ data/ tests/
 
-returns nothing. The GPU half (Person B) uses the OpenAI-compatible *client
+returns nothing. The GPU half uses the OpenAI-compatible *client
 library* pointed exclusively at a local vLLM endpoint on this machine; the
 library is local and no remote endpoint is configured anywhere. Model
 serving dependencies and pinned ROCm/vLLM/PyTorch versions: `infra/versions.md`.

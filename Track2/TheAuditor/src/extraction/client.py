@@ -1,8 +1,9 @@
 """The ONLY file in the repo permitted to import a model client.
 
-The seam rule from the handoff, restated as code: the dependency-audit grep in
+The seam rule, restated as code: the dependency-audit grep in
 the README should return exactly this file. Everything else runs on pydantic
-alone, which is what keeps A's half demoable if the GPU side is unavailable.
+alone, which is what keeps the deterministic half demoable if the GPU side
+is unavailable.
 
 LOCALITY IS ENFORCED HERE, NOT PROMISED IN THE README
 ----------------------------------------------------
@@ -64,6 +65,16 @@ def _assert_no_stray_credentials() -> list[str]:
             if os.environ.get(k)]
 
 
+#: Server capabilities learned at runtime. Module level, not dataclass fields:
+#: a dataclass default is copied onto every instance at construction, so a
+#: class-attribute write would not reach the clients already built. There is
+#: one server per process and this is a property of that server.
+_QUIRKS: dict[str, object] = {
+    "thinking_kwarg": True,        # server accepts chat_template_kwargs
+    "guided_style": "guided_json",  # -> "response_format" -> "none"
+}
+
+
 @dataclass
 class Usage:
     """What a call cost. Fed straight into the ladder's cost accounting."""
@@ -71,6 +82,14 @@ class Usage:
     completion_tokens: int = 0
     cached_tokens: int = 0
     latency_ms: float = 0.0
+    #: Per-choice finish reason. "length" means max_tokens truncated the JSON,
+    #: which presents downstream as an unparseable record and would otherwise
+    #: be misread as the model failing at extraction.
+    finish_reasons: list[str] = field(default_factory=list)
+
+    @property
+    def truncated(self) -> bool:
+        return any(r == "length" for r in self.finish_reasons)
 
     @property
     def cache_hit_rate(self) -> float:
@@ -103,16 +122,60 @@ class LocalVLLM:
     @property
     def client(self):
         """Imported lazily so the module is importable, and testable, without
-        the openai package present. A's tests must never need it."""
+        the openai package present. The deterministic tests must never need it."""
         if self._client is None:
             from openai import OpenAI              # noqa: PLC0415
             self._client = OpenAI(base_url=self.base_url, api_key="local",
                                   timeout=self.timeout)
         return self._client
 
+    # --- server quirk negotiation -------------------------------------------
+    #
+    # Learned once per process, on the first rejection, then reused. NOT a
+    # cleverness layer: both of these are documented API differences that
+    # produce a 400 at request time, and a 400 on the instance costs an hour
+    # of "is ROCm broken?" before anyone reads the body of the error.
+    #
+    #   enable_thinking  a Qwen3 chat-template kwarg. Templates that do not
+    #                    define it raise a Jinja error, so the serving gate's
+#                    health check
+    #                    fails on any non-Qwen model and looks like a serving
+    #                    failure. It is an optimisation, so it degrades.
+    #
+    #   guided_json      vLLM's own extension. Newer builds moved structured
+    #                    output to the OpenAI `response_format` json_schema
+    #                    form. Losing guided decoding entirely because a flag
+    #                    was renamed would cost the malformed-output guarantee
+    #                    AND misattribute it to the model.
+    #
+    # Each degradation is announced. A silent fallback would let a sweep row
+    # be recorded as "guided" when it was not.
+
+    def _request(self, messages: list[dict], guided_json: Optional[dict],
+                 n: int, max_tokens: int):
+        kwargs: dict[str, Any] = dict(
+            model=self.model, messages=messages, n=n,
+            temperature=self.temperature if n == 1 else max(self.temperature, 0.7),
+            max_tokens=max_tokens)
+        extra: dict[str, Any] = {}
+        if _QUIRKS["thinking_kwarg"]:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
+        if guided_json is not None:
+            if _QUIRKS["guided_style"] == "guided_json":
+                extra["guided_json"] = guided_json
+            elif _QUIRKS["guided_style"] == "response_format":
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "canonical_doc", "strict": True,
+                                    "schema": guided_json}}
+        if extra:
+            kwargs["extra_body"] = extra
+        return self.client.chat.completions.create(**kwargs)
+
     def complete(self, messages: list[dict],
                  guided_json: Optional[dict] = None,
-                 n: int = 1) -> tuple[list[str], Usage]:
+                 n: int = 1, max_tokens: Optional[int] = None,
+                 retries: int = 2) -> tuple[list[str], Usage]:
         """One call. `n>1` samples in a SINGLE request on purpose.
 
         Self-consistency needs N samples of the same prompt. Sending them as
@@ -120,19 +183,43 @@ class LocalVLLM:
         so wall-clock is roughly one generation rather than N sequential ones.
         The GPU work is still genuinely N times, which is why the cost model
         counts N and the wall-clock does not.
-        """
-        extra: dict[str, Any] = {}
-        if guided_json is not None:
-            extra["guided_json"] = guided_json
-        # Qwen3 and friends: reasoning tokens inflate latency and interfere
-        # with guided decoding. Extraction is transcription, not reasoning.
-        extra["chat_template_kwargs"] = {"enable_thinking": False}
 
+        Retries exist because a run of 60 documents at concurrency 8 against a
+        server that hiccups once should lose one second, not one row. A lost
+        row is not neutral: it lands in the sweep table as a parse failure and
+        silently lowers a configuration's score.
+        """
         t0 = time.perf_counter()
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, n=n,
-            temperature=self.temperature if n == 1 else max(self.temperature, 0.7),
-            max_tokens=self.max_tokens, extra_body=extra)
+        last: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                resp = self._request(messages, guided_json, n,
+                                     max_tokens or self.max_tokens)
+                break
+            except Exception as exc:                            # noqa: BLE001
+                last, text = exc, str(exc).lower()
+                if _QUIRKS["thinking_kwarg"] and "enable_thinking" in text:
+                    _QUIRKS["thinking_kwarg"] = False
+                    print("  [client] server rejected enable_thinking; "
+                          "disabling it. Confirm this model has no reasoning "
+                          "mode, or latency will include reasoning tokens.")
+                    continue
+                if guided_json is not None and _QUIRKS["guided_style"] != "none" \
+                        and ("guided_json" in text or "response_format" in text
+                             or "extra_body" in text or "unrecognized" in text):
+                    _QUIRKS["guided_style"] = (
+                        "response_format"
+                        if _QUIRKS["guided_style"] == "guided_json" else "none")
+                    print(f"  [client] guided decoding fell back to "
+                          f"{_QUIRKS['guided_style']!r}. Record this in the "
+                          f"sweep row: it changes what the number means.")
+                    continue
+                if attempt < retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+        else:                                                   # pragma: no cover
+            raise last                                          # type: ignore[misc]
         dt = (time.perf_counter() - t0) * 1000
 
         u = getattr(resp, "usage", None)
@@ -144,14 +231,32 @@ class LocalVLLM:
             [c.message.content or "" for c in resp.choices],
             Usage(prompt_tokens=getattr(u, "prompt_tokens", 0) if u else 0,
                   completion_tokens=getattr(u, "completion_tokens", 0) if u else 0,
-                  cached_tokens=cached, latency_ms=dt),
+                  cached_tokens=cached, latency_ms=dt,
+                  finish_reasons=[getattr(c, "finish_reason", "") or ""
+                                  for c in resp.choices]),
         )
 
     def health(self) -> tuple[bool, str]:
-        """B2's gate, as one call. Returns (ok, message)."""
+        """The serving gate, as one call. Returns (ok, message)."""
         try:
             out, usage = self.complete(
                 [{"role": "user", "content": "Reply with the single word: ready"}])
             return True, f"{self.model} responded in {usage.latency_ms:.0f} ms: {out[0][:40]!r}"
         except Exception as exc:                                # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
+
+
+def guided_mode() -> str:
+    """What guided decoding actually ended up being, after negotiation.
+
+    Recorded in the run manifest and in the sweep row. "we used guided JSON"
+    and "the server rejected it and we ran free-form" produce different
+    accuracy numbers, and a table that does not say which is not comparable.
+    """
+    return str(_QUIRKS["guided_style"])
+
+
+def thinking_disabled() -> bool:
+    """False if the server refused the kwarg, i.e. reasoning tokens may be in
+    the latency figure. Belongs in the sweep row for the same reason."""
+    return bool(_QUIRKS["thinking_kwarg"])

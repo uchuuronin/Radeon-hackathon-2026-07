@@ -1,4 +1,4 @@
-"""A5 — Mechanism A. The deterministic verifier.
+"""Mechanism A — the deterministic verifier.
 
 Pure Python, zero GPU, zero model. This module is simultaneously three things
 the plan asks for: the accuracy safeguard (a mis-read is caught before it

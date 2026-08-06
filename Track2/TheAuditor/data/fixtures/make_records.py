@@ -1,4 +1,4 @@
-"""A4 — ten HAND-WRITTEN CanonicalDoc fixtures.
+"""Ten HAND-WRITTEN CanonicalDoc fixtures.
 
 WHY HAND-WRITTEN AND NOT DERIVED FROM gen.py
 --------------------------------------------
@@ -7,7 +7,7 @@ generator, a bug in the generator would propagate into them and nothing left
 in the project could catch it. Every number below was chosen and multiplied
 by hand; this file contains literals and serialisation only — no generation
 logic. tests/test_fixtures.py re-checks the arithmetic independently, so a
-typo here fails loudly instead of poisoning Person B's extraction target.
+typo here fails loudly instead of poisoning the extraction target.
 
 WHY THE LAYOUTS LOOK LIKE REAL SOFTWARE
 ---------------------------------------
@@ -16,7 +16,8 @@ Xero, SAP, Coupa, NetSuite, Zoho, Stripe, Bill.com, a WMS goods receipt, and
 Wave. The generator's Layout A/B are OUR OWN inventions, so extraction that
 works on them proves nothing about documents we did not design. These ten are
 the closest thing to market reality available without scraping real
-(confidential) documents, and they are exactly what B's prompt should be
+(confidential) documents, and they are exactly what the extraction prompt
+should be
 developed against first.
 
 Coverage deliberately spans:

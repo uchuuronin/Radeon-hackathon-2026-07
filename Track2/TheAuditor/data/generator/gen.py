@@ -1,8 +1,8 @@
-"""A1 — the clean-chain generator.
+"""The clean-chain generator.
 
 Emits internally-consistent quote-to-cash chains. NO anomalies: a generator
 that produces broken documents by accident is unusable as ground truth, so
-correctness comes first and injection (A3) comes second, on top of this.
+correctness comes first and anomaly injection comes second, on top of this.
 
 Every chain satisfies the EN 16931 identities exactly:
     BR-CO-10   sum(line_total)          == subtotal
@@ -199,7 +199,7 @@ def generate_chain(chain_index: int, seed: int,
     key = ChainKey(
         chain_id=chain_id,
         doc_ids=[d.doc_id for d in docs],
-        anomalies=[],                    # CLEAN. Injection is A3.
+        anomalies=[],                    # CLEAN. Injection is a separate pass.
         generator_seed=seed,
         layouts_emitted=[Layout.A, Layout.B],
     )
@@ -320,7 +320,7 @@ def main() -> None:
     p.add_argument("--out", type=Path, default=Path("data/generated"))
     p.add_argument("--layouts", default="layout_a,layout_b")
     p.add_argument("--clean", action="store_true",
-                   help="skip anomaly injection (A1 behaviour)")
+                   help="emit clean chains only, no anomaly injection")
     a = p.parse_args()
 
     layouts = [Layout(x.strip()) for x in a.layouts.split(",")]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B5 — the sizing sweep, deliberately small.
+# The sizing sweep, deliberately small.
 #
 #   bash bench/sweep.sh <served-model-name> <label>
 #
@@ -12,6 +12,14 @@
 # are choosing on noise. Above ~200 documents you are spending instance time to
 # narrow an interval that is already narrow enough to decide with.
 set -eu
+#
+# VRAM and UTILISATION are not guessable from inside this process. Get them
+# from bench/throughput.sh (which samples rocm-smi alongside a run) and pass
+# them in, or the row lands saying so. A throughput figure without the
+# utilisation it was measured at is not a systems result, and the row prints
+# UTILISATION NOT RECORDED rather than quietly omitting it.
+#
+#   VRAM_GB=21.4 UTIL=82 bash bench/sweep.sh <model> <label>
 MODEL="${1:?model}"; LABEL="${2:-$1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PYTHONPATH="$ROOT/src"
@@ -22,14 +30,18 @@ python "$ROOT/src/extraction/run.py" \
   --records "$ROOT/data/generated/records.jsonl" \
   --out "$OUT/extracted.jsonl" \
   --model "$MODEL" --limit 60 --layout layout_a --concurrency 8 \
+  --base-url "${BASE_URL:-http://localhost:8000/v1}" \
   --prompt-id "$LABEL" | tee "$OUT/run.log"
 
+# --append-row emits ONE comparable row: config, guided mode, scoring mode, n,
+# line-item numeric, identifier, doc numeric, precision loss, cache, docs/s at
+# utilisation, peak VRAM, run health. A free-form code block per configuration
+# reads fine and cannot be compared row to row, which is how a tier gets picked
+# on a point estimate whose interval overlaps the alternative.
 python "$ROOT/bench/score.py" \
   --truth "$ROOT/data/generated/records.jsonl" \
   --got "$OUT/extracted.jsonl" --layout layout_a \
-  --label "$LABEL" | tee "$OUT/score.md"
-
-{ echo; echo "### $LABEL"; echo '```'
-  cat "$OUT/score.md"; echo; grep -E 'throughput|prefix cache|latency' "$OUT/run.log" || true
-  echo '```'; } >> "$ROOT/bench/tier_selection.md"
-echo "appended -> bench/tier_selection.md"
+  --label "$LABEL" \
+  --append-row "$ROOT/bench/tier_selection.md" \
+  ${VRAM_GB:+--vram-gb "$VRAM_GB"} ${UTIL:+--utilisation "$UTIL"} \
+  | tee "$OUT/score.md"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# B2 — serve a model. THE Day-2 gate.
+# Serve a model. THE gate.
 #
 #   bash infra/serve.sh Qwen/Qwen3-8B            # BF16, the safe first move
 #   bash infra/serve.sh <model> --quantization awq
