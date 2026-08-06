@@ -161,10 +161,14 @@ def test_markdown_table_has_a_row_per_condition():
 # ---------------------------------------------------------------------------
 
 def test_cli_runs_end_to_end_on_a_small_generated_corpus(tmp_path):
+    # No PYTHONPATH set here deliberately: link_score.py must set it for its
+    # own gen.py subprocess internally, not rely on the test runner's shell
+    # having exported it (that was the actual bug this test caught).
+    env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONPATH"}
     proc = subprocess.run(
         [sys.executable, str(ROOT / "bench" / "link_score.py"),
          "--n", "12", "--seed", "99", "--md", str(tmp_path / "out.md")],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=env,
     )
     assert proc.returncode == 0, proc.stderr
     assert "clean" in proc.stdout

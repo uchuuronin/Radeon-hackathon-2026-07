@@ -215,15 +215,26 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.corpus is None:
+        import os
         import subprocess
         import tempfile
         tmp = Path(tempfile.mkdtemp(prefix="link_score_corpus_"))
+        root = Path(__file__).resolve().parents[1]
+        # gen.py does `from schemas import ...`, which only resolves if
+        # PYTHONPATH includes src/. Pytest's `pythonpath` ini setting (and
+        # any PYTHONPATH the caller's shell happens to have exported) does
+        # NOT propagate to a subprocess -- only real environment variables
+        # do. Set it explicitly so this works regardless of how link_score.py
+        # itself was invoked, instead of silently depending on the caller's
+        # shell state.
+        env = {**os.environ,
+              "PYTHONPATH": str(root / "src") + os.pathsep
+                            + os.environ.get("PYTHONPATH", "")}
         subprocess.run(
-            [sys.executable, str(Path(__file__).resolve().parents[1]
-                                 / "data" / "generator" / "gen.py"),
+            [sys.executable, str(root / "data" / "generator" / "gen.py"),
              "--n", str(args.n), "--seed", str(args.seed),
              "--out", str(tmp), "--layouts", args.layout],
-            check=True)
+            check=True, env=env)
         corpus_dir = tmp
     else:
         corpus_dir = args.corpus
