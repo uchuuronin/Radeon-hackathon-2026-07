@@ -97,6 +97,51 @@ class TestTheMoneyGateIsNotAppliedWhereItIsUndefined:
         d = v.discrepancies[0]
         assert d.field_path == "line_items[LI-001].quantity"
         assert d.delta == Decimal("1")
+        # No order to arbitrate with, so the label is a guess and says so.
+        assert any("labelled by sign only" in t for t in v.trace)
+
+
+class TestTheOrderArbitratesWhichDocumentMoved:
+    """`received < billed` cannot tell an over-bill from a short shipment: both
+    produce the identical shape and their distributions overlap completely. The
+    ORDER is the third reference point. Whichever of receipt and invoice still
+    agrees with what was ordered is the document that did not move."""
+
+    def _three(self, ordered, received, billed):
+        po = _doc("D-3", "PO-1", DocType.PURCHASE_ORDER,
+                  [_li("LI-001", ordered, "50.00")])
+        grn = _doc("D-4", "GRN-1", DocType.GOODS_RECEIPT,
+                   [_li("LI-001", received, "0")])
+        grn.total = grn.subtotal = None
+        inv = _doc("D-5", "INV-1", DocType.INVOICE,
+                   [_li("LI-001", billed, "50.00")])
+        return _chain(po, grn, inv)
+
+    def test_receipt_matches_the_order_so_the_invoice_over_billed(self):
+        chain, docs = self._three("10", "10", "12")
+        d = next(x for x in reconcile(chain, docs).discrepancies
+                 if "quantity" in x.field_path)
+        assert d.anomaly_type == AnomalyType.QUANTITY_MISMATCH
+        # An over-bill reports what was ADDED.
+        assert d.delta == Decimal("2")
+
+    def test_invoice_matches_the_order_so_the_shipment_fell_short(self):
+        chain, docs = self._three("10", "8", "10")
+        d = next(x for x in reconcile(chain, docs).discrepancies
+                 if "quantity" in x.field_path)
+        assert d.anomaly_type == AnomalyType.PARTIAL_SHIPMENT
+        # A short shipment reports what is MISSING, so the sign flips. The
+        # number is unreadable without the label otherwise.
+        assert d.delta == Decimal("-2")
+
+    def test_when_neither_matches_the_order_it_is_not_attributed(self):
+        """Genuinely ambiguous. Isolate rather than guess, the same principle
+        the linker applies to an unresolvable reference: a wrong label sends an
+        analyst looking for the wrong kind of problem."""
+        chain, docs = self._three("10", "8", "12")
+        v = reconcile(chain, docs)
+        assert not [x for x in v.discrepancies if "quantity" in x.field_path]
+        assert any("neither matches the order" in t for t in v.trace)
 
     def test_a_missing_total_is_never_reported_as_clean(self):
         """Silently passing a document we could not check is the worst
@@ -150,6 +195,7 @@ class TestAnomaliesWithNoAggregateSignature:
                  references=["PO-1"])
         chain, docs = _chain(a, b)
         v = reconcile(chain, docs)
+        assert len(v.discrepancies) == 1
         d = next(x for x in v.discrepancies
                  if x.anomaly_type == AnomalyType.NEAR_DUPLICATE)
         assert d.field_path == "doc_number"
@@ -232,3 +278,29 @@ class TestAgainstTheCorpus:
         assert s.clean_chains_flagged == 0, "a clean chain was flagged"
         assert s.precision[0] == 1.0
         assert s.recall[0] > 0.95
+
+
+class TestStrictDuplicateDetection:
+    """Two invoices in one chain is not enough. On this corpus all 30
+    multi-invoice chains are planted duplicates so the loose rule costs
+    nothing, but partial billing puts two legitimate invoices against one
+    order and the loose rule flags it."""
+
+    def _two(self, total_a, total_b, refs_a, refs_b):
+        a = _doc("D-5", "INV-1", DocType.INVOICE,
+                 [_li("LI-001", "1", total_a)], references=list(refs_a))
+        b = _doc("D-6", "INV-2", DocType.INVOICE,
+                 [_li("LI-001", "1", total_b)], references=list(refs_b))
+        return _chain(a, b)
+
+    def test_different_totals_are_not_a_duplicate(self):
+        chain, docs = self._two("500.00", "300.00", ["PO-1"], ["PO-1"])
+        v = reconcile(chain, docs)
+        assert not v.discrepancies
+        assert any("different totals" in t for t in v.trace)
+
+    def test_same_total_against_different_orders_is_not_a_duplicate(self):
+        chain, docs = self._two("500.00", "500.00", ["PO-1"], ["PO-9"])
+        v = reconcile(chain, docs)
+        assert not v.discrepancies
+        assert any("different upstream documents" in t for t in v.trace)
