@@ -48,6 +48,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from ladder import (Rung, break_even_escalation_rate)      # noqa: E402
 
 
 def load(path: Path) -> dict:
@@ -118,13 +121,21 @@ def main() -> int:
               "\n  outcome — cascades have been measured scoring BELOW "
               "\n  always-using-the-larger-model while costing more.")
     else:
-        break_even = 1.0 / weight
+        # Derived by ladder.break_even_escalation_rate, NOT recomputed here.
+        # This file previously used 1.0/weight, which solves "the escalated
+        # share costs as much as the fast tier" rather than "the cascade costs
+        # as much as the baseline": it forgets the fast-tier call every case
+        # has already paid, and under-reports the break-even by half. Two
+        # implementations of one number is how a headline claim ends up
+        # disagreeing with the test that is supposed to guard it.
+        weights = {Rung.FAST_TIER: 1.0, Rung.PRECISE_TIER: weight}
         print(f"\n  At this ratio the cascade stops saving compute once the "
-              f"escalation\n  rate passes roughly {break_even:.0%} for a "
+              f"escalation\n  rate passes roughly "
+              f"{break_even_escalation_rate(1, weights):.0%} for a "
               f"single-sample precise pass,")
         for n in (3, 5):
-            print(f"    or roughly {break_even / n:.0%} at N={n} "
-                  f"self-consistency samples.")
+            print(f"    or roughly {break_even_escalation_rate(n, weights):.0%} "
+                  f"at N={n} self-consistency samples.")
         print("  That is the kill-metric, derived rather than assumed. The "
               "~50%\n  figure in the plan is a target, not an industry "
               "constant.")
