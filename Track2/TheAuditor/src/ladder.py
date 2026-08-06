@@ -58,7 +58,7 @@ from contextlib import contextmanager
 from enum import Enum
 from itertools import count
 from statistics import median
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, NamedTuple, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -100,6 +100,140 @@ TIER_WEIGHT: dict[Rung, float] = {
     Rung.FAST_TIER: 1.0,
     Rung.PRECISE_TIER: 3.0,
 }
+
+
+class RouteAction(str, Enum):
+    AUTO_RESOLVE = "auto_resolve"
+    ESCALATE = "escalate"
+
+
+class RouteDecision(NamedTuple):
+    """Where a case goes next, and why.
+
+    NOT a bare "auto"/"escalate" string. The ladder is built around rungs, and
+    a router that cannot name the rung it is sending work to cannot be costed:
+    escalating to the precise tier costs TIER_WEIGHT[PRECISE_TIER] x N, while
+    escalating to a human costs a person. Collapsing those into one word makes
+    the cost model unwritable and the kill-metric unmeasurable.
+    """
+    action: RouteAction
+    next_rung: Optional[Rung]
+    reason: str
+
+
+def route(*, verify_pass: bool, agreement: float,
+          from_rung: Rung = Rung.FAST_TIER,
+          tau_hi: float = 0.95, tau_lo: float = 0.70) -> RouteDecision:
+    """Compose the confidence signal into one routing decision.
+
+    THE SIGNAL HAS TWO PARTS AND THEY ARE NOT THE SAME KIND OF THING.
+
+    `verify_pass` is deterministic arithmetic. It needs no calibration and
+    cannot be miscalibrated: the identities hold or they do not. `agreement` is
+    self-consistency across sampled extractions, whose ORDERING is robust but
+    whose absolute value is not, which is why the thresholds are parameters
+    calibrated against a risk-coverage curve rather than constants anyone
+    picked.
+
+    WHY THREE OUTCOMES AND NOT TWO. Sending everything uncertain to a human
+    wastes the precise tier, which exists precisely for cases a better read can
+    settle. It also makes `tau_lo` meaningless: if the low band and the middle
+    band both mean "escalate", the parameter cannot change any output, and a
+    threshold that cannot change an output is not a threshold.
+
+      verify_pass and agreement >= tau_hi   -> auto-resolve
+      verify_pass and agreement <  tau_lo   -> the samples genuinely disagree
+      verify_pass and in between            -> not confident enough to auto
+      not verify_pass                       -> the arithmetic did not hold
+
+    WHY A FAILED VERIFICATION GOES TO THE PRECISE TIER AND NOT STRAIGHT TO A
+    HUMAN. A failed identity usually means a number was misread, not that the
+    deal is broken, and re-reading is exactly what the precise tier is for.
+    Only once the precise tier has already looked does a human become the
+    cheapest remaining option, which is why `from_rung` is an input: the same
+    evidence routes differently depending on what has already been spent.
+    """
+    if not 0.0 <= agreement <= 1.0:
+        raise ValueError(f"agreement must be in [0,1], got {agreement}")
+    if not 0.0 <= tau_lo <= tau_hi <= 1.0:
+        raise ValueError(f"need 0 <= tau_lo <= tau_hi <= 1, "
+                         f"got tau_lo={tau_lo} tau_hi={tau_hi}")
+
+    exhausted = from_rung.index >= Rung.PRECISE_TIER.index
+    onward = Rung.HUMAN if exhausted else Rung.PRECISE_TIER
+
+    if not verify_pass:
+        return RouteDecision(
+            RouteAction.ESCALATE, onward,
+            "deterministic verification failed; the arithmetic did not hold"
+            + ("" if exhausted else
+               ", which usually means a misread number rather than a broken deal"))
+    if agreement >= tau_hi:
+        return RouteDecision(
+            RouteAction.AUTO_RESOLVE, None,
+            f"verification passed and sample agreement {agreement:.2f} "
+            f">= tau_hi {tau_hi:.2f}")
+    if agreement < tau_lo:
+        return RouteDecision(
+            RouteAction.ESCALATE, onward,
+            f"sample agreement {agreement:.2f} < tau_lo {tau_lo:.2f}: the "
+            f"samples genuinely disagree")
+    return RouteDecision(
+        RouteAction.ESCALATE, onward,
+        f"sample agreement {agreement:.2f} sits between tau_lo {tau_lo:.2f} "
+        f"and tau_hi {tau_hi:.2f}: not confident enough to auto-resolve")
+
+
+# ---------------------------------------------------------------------------
+# The cost model the kill-metric is derived from
+# ---------------------------------------------------------------------------
+
+def tiered_cost_per_case(escalation_rate: float, n_samples: int = 1,
+                         weights: Optional[dict[Rung, float]] = None) -> float:
+    """Expected ladder cost per case, in fast-tier-call units.
+
+    EVERY case pays the fast tier; only the escalated share pays the precise
+    tier, and it pays N times because self-consistency is N forward passes. It
+    batches into one request so wall-clock is roughly one generation, but the
+    GPU work is genuinely N and the cost model counts GPU work.
+
+    Lives here rather than in a test file. A helper defined inside a test
+    asserts properties of itself, and nothing in the product is bound by it.
+    """
+    w = weights or TIER_WEIGHT
+    if not 0.0 <= escalation_rate <= 1.0:
+        raise ValueError(f"escalation_rate must be in [0,1], got {escalation_rate}")
+    if n_samples < 1:
+        raise ValueError(f"n_samples must be >= 1, got {n_samples}")
+    return (w[Rung.FAST_TIER]
+            + escalation_rate * n_samples * w[Rung.PRECISE_TIER])
+
+
+def naive_cost_per_case(weights: Optional[dict[Rung, float]] = None) -> float:
+    """The baseline: always use the precise model, once, on everything."""
+    return (weights or TIER_WEIGHT)[Rung.PRECISE_TIER]
+
+
+def break_even_escalation_rate(n_samples: int = 1,
+                               weights: Optional[dict[Rung, float]] = None
+                               ) -> float:
+    """Escalation rate at which the cascade stops saving anything.
+
+    DERIVED, not the ~50% figure from the plan. That number is a target we set,
+    not an industry constant, and the real break-even falls straight out of the
+    tier ratio: at TIER_WEIGHT 3.0 it is 67% for a single precise pass but only
+    22% at N=3 and 13% at N=5. Sampling eats the cascade's margin far faster
+    than the headline rate suggests, which is exactly the failure mode where
+    cascades have been measured scoring BELOW always-using-the-larger-model
+    while costing more.
+
+    Returns 0.0 when even a fully-cheap cascade cannot beat the baseline.
+    """
+    w = weights or TIER_WEIGHT
+    headroom = naive_cost_per_case(w) - w[Rung.FAST_TIER]
+    if headroom <= 0:
+        return 0.0
+    return max(0.0, min(1.0, headroom / (n_samples * w[Rung.PRECISE_TIER])))
 
 
 class _Base(BaseModel):
