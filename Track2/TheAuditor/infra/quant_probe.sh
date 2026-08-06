@@ -68,8 +68,13 @@ probe_one() {
 
   local gen="-" vram="-" note=""
   if [ "$ok" = "yes" ]; then
+    # bench/gpu_stats.py, not `grep -oE '[0-9]+' | tail -1`: tail -1 assumes
+    # exactly one GPU line in the output and silently returns the WRONG
+    # device's reading the moment rocm-smi reports a second device (a
+    # workstation iGPU alongside the discrete card is common). Explicit
+    # device 0 instead of "whichever line printed last".
     vram="$(rocm-smi --showmemuse 2>/dev/null \
-            | grep -oE '[0-9]+' | tail -1 || echo '-')"
+            | python3 "$ROOT/bench/gpu_stats.py" memuse 0 2>/dev/null || echo '-')"
     gen="$(curl -sf "http://127.0.0.1:$PORT/v1/completions" \
         -H 'Content-Type: application/json' \
         -d "{\"model\":\"$MODEL\",\"prompt\":\"List three colours:\",\"max_tokens\":20,\"temperature\":0}" \
